@@ -292,7 +292,10 @@ Future<({File zip, Map<String, Object?> meta})> collectReport(
     ].reversed.take(20).toList(),
   };
   onStage?.call(ReportStage.logs);
-  final syncLog = await _recentLog();
+  // No log file (older iOS builds never wrote one): fall back to the lines
+  // this session kept in memory, oldest first.
+  var syncLog = await _recentLog();
+  if (syncLog.isEmpty) syncLog = app.logLines.reversed.join('\n');
   final shot = draft.screenshotPath == null
       ? null
       : await File(draft.screenshotPath!).readAsBytes();

@@ -15729,5 +15729,14 @@
   "reportStageSharing": "Preparing to share…",
   "@reportStageSharing": {
     "description": "Report screen: progress text inside the busy button."
+  },
+  "reportIdCopied": "Copied {id}",
+  "@reportIdCopied": {
+    "description": "Snackbar after copying the ticket ID on the report screen.",
+    "placeholders": {
+      "id": {
+        "type": "String"
+      }
+    }
   }
 }

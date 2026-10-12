@@ -8,7 +8,8 @@ import 'dart:async';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart' show Clipboard, ClipboardData;
+import 'package:flutter/services.dart'
+    show Clipboard, ClipboardData, HapticFeedback;
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:provider/provider.dart';
 import 'package:share_plus/share_plus.dart';
@@ -345,8 +346,13 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> {
                   StatusCard(l.reportSentTitle, l.reportSentBody(sent.id),
                       icon: LucideIcons.check,
                       fix: l.reportCopyId,
-                      onFix: () =>
-                          Clipboard.setData(ClipboardData(text: sent.id))),
+                      onFix: () async {
+                        final messenger = ScaffoldMessenger.of(c);
+                        await Clipboard.setData(ClipboardData(text: sent.id));
+                        HapticFeedback.selectionClick();
+                        messenger.showSnackBar(
+                            SnackBar(content: Text(l.reportIdCopied(sent.id))));
+                      }),
                 ],
                 if (err != null) ...[
                   const SizedBox(height: S.x5),

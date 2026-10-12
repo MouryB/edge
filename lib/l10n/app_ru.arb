@@ -7497,5 +7497,13 @@
       }
     }
   },
-  "reportStageSharing": "Подготовка к отправке…"
+  "reportStageSharing": "Подготовка к отправке…",
+  "reportIdCopied": "Скопировано: {id}",
+  "@reportIdCopied": {
+    "placeholders": {
+      "id": {
+        "type": "String"
+      }
+    }
+  }
 }
