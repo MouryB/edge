@@ -2884,7 +2884,8 @@ class AppState extends ChangeNotifier {
       await NotificationCenter.instance.scheduleAiReminders(
         prefs,
         ai,
-        aiConfigured: coachConfig?.hasKey ?? false,
+        aiConfigured: (coachConfig?.hasKey ?? false) ||
+            (coachConfig?.usesChatGpt ?? false),
         bedtimeMinOfDay: cd.bedtimeMin,
         journalDoneToday: BriefingStore.journalDoneToday(),
         sweepHeadline: await _sweepHeadlineNow(),

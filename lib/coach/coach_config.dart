@@ -8,6 +8,8 @@ import 'package:flutter/services.dart' show PlatformException;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'coach_chatgpt.dart';
+
 /// The origin (`scheme://host[:port]`) [url] resolves to, or the trimmed
 /// string itself when it doesn't parse as a URI with a host.
 ///
@@ -139,6 +141,7 @@ class CoachConfig extends ChangeNotifier {
   static const _kApi = 'coach_api';
   static const _kKey = 'coach_api_key'; // secure storage
   static const _kTimeoutSeconds = 'coach_timeout_seconds';
+  static const _kUseChatGpt = 'coach_use_chatgpt';
 
   /// A local model's first response includes Ollama/LM Studio loading the
   /// whole model into memory, which alone can pass two minutes on modest
@@ -189,6 +192,17 @@ class CoachConfig extends ChangeNotifier {
 
   final FlutterSecureStorage _secure = const FlutterSecureStorage();
 
+  CoachConfig({ChatGptAuth? chatgpt}) : chatgpt = chatgpt ?? ChatGptAuth() {
+    this.chatgpt.addListener(notifyListeners);
+  }
+
+  /// "Sign in with ChatGPT". When [usesChatGpt], requests go to OpenAI's
+  /// Responses API on the user's ChatGPT plan instead of the BYOK endpoint;
+  /// the BYOK settings are kept untouched for switching back.
+  final ChatGptAuth chatgpt;
+  bool _useChatGpt = false;
+  bool get usesChatGpt => _useChatGpt;
+
   String _baseUrl = defaultBaseUrl;
   CoachApi _api = CoachApi.defaultFor(defaultBaseUrl);
   String _model = '';
@@ -200,7 +214,7 @@ class CoachConfig extends ChangeNotifier {
   /// user can fix by pasting one — this one fixes itself on the next unlocked
   /// read, and telling them to set a key up again would be wrong.
   bool _keyUnreadable = false;
-  bool get keyUnreadable => _keyUnreadable;
+  bool get keyUnreadable => _useChatGpt ? chatgpt.unreadable : _keyUnreadable;
 
   /// True while it is still unknown whether a key is stored — an install that
   /// predates the marker, read while the keychain was unavailable. Not shown to
@@ -255,7 +269,7 @@ class CoachConfig extends ChangeNotifier {
   }
 
   String get baseUrl => _baseUrl;
-  CoachApi get api => _api;
+  CoachApi get api => _useChatGpt ? CoachApi.responses : _api;
   String get model => _model;
   /// The saved, user-configurable timeout — meaningful only for a local
   /// endpoint (see [requestTimeout]), but kept intact and readable regardless
@@ -284,11 +298,13 @@ class CoachConfig extends ChangeNotifier {
   /// Narrower than [isLocalEndpoint]; see [isPrivateCoachHost].
   bool get isPrivateEndpoint => isPrivateCoachHost(apiBase);
 
-  bool get configured =>
-      (hasKey || isLocalEndpoint) && _baseUrl.isNotEmpty && _model.isNotEmpty;
+  bool get configured => _useChatGpt
+      ? chatgpt.sharing && _model.isNotEmpty
+      : (hasKey || isLocalEndpoint) && _baseUrl.isNotEmpty && _model.isNotEmpty;
 
   /// Normalised base, no trailing slash.
   String get apiBase {
+    if (_useChatGpt) return kChatGptApiBase;
     var b = _baseUrl.trim();
     while (b.endsWith('/')) {
       b = b.substring(0, b.length - 1);
@@ -300,7 +316,11 @@ class CoachConfig extends ChangeNotifier {
   /// device unlocked — the only condition under which an EMPTY read is real
   /// evidence about what is stored.
   Future<void> load({bool trusted = false}) async {
+    // Its own keychain item, read alongside the key rather than ahead of it so
+    // one hung read cannot hold up the other.
+    final chatgptLoad = chatgpt.load(trusted: trusted).catchError((_) {});
     final prefs = await SharedPreferences.getInstance();
+    _useChatGpt = prefs.getBool(_kUseChatGpt) ?? false;
     _baseUrl = prefs.getString(_kBaseUrl) ?? defaultBaseUrl;
     _api = switch (prefs.getString(_kApi)) {
       'responses' => CoachApi.responses,
@@ -388,6 +408,7 @@ class CoachConfig extends ChangeNotifier {
       _keyUnreadable = marker == true;
       _keyUndetermined = marker == null;
     }
+    await chatgptLoad;
     notifyListeners();
   }
 
@@ -396,7 +417,7 @@ class CoachConfig extends ChangeNotifier {
   /// otherwise, so it is safe on every resume, which is exactly when a phone
   /// that was locked during a background relaunch becomes readable again.
   Future<void> refreshKeyOnResume() async {
-    if (!_keyUnreadable && !_keyUndetermined) return;
+    if (!_keyUnreadable && !_keyUndetermined && !chatgpt.unreadable) return;
     await load(trusted: true);
   }
 
@@ -409,8 +430,13 @@ class CoachConfig extends ChangeNotifier {
     String? model,
     String? apiKey,
     int? timeoutSeconds,
+    bool? useChatGpt,
   }) async {
     final prefs = await SharedPreferences.getInstance();
+    if (useChatGpt != null) {
+      _useChatGpt = useChatGpt;
+      await prefs.setBool(_kUseChatGpt, useChatGpt);
+    }
     if (baseUrl != null) {
       final previousOrigin = coachEndpointOrigin(_baseUrl);
       _baseUrl = baseUrl.trim().isEmpty ? defaultBaseUrl : baseUrl.trim();
