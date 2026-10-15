@@ -290,11 +290,24 @@ class ChatGptAuth extends ChangeNotifier {
   Future<String>? _refreshing;
 
   /// Bumped whenever a sign-in commits a session, and at the very start of
-  /// [signOut]/[forgetAll]. A [load] or [_refresh] that started under an older
-  /// value must not apply its result — a slow keychain read or token call
+  /// [signOut]/[forgetAll]. A [load], [_refresh] or [signIn] that started under
+  /// an older value must not apply its result — a slow keychain read or token call
   /// would otherwise bring back a session the user just ended (same idea as
   /// CoachConfig._generation).
   int _generation = 0;
+
+  /// Keychain writes, deletes and the marker run one at a time, like
+  /// CoachConfig._serialized: a sign-out can then never interleave with a
+  /// store's awaits — it runs after one already writing, and ahead of any
+  /// still queued (which see the new generation and are rejected).
+  Future<void> _lock = Future.value();
+
+  Future<void> _serialized(Future<void> Function() op) {
+    final done = _lock.then((_) => op());
+    // A failed operation must not wedge the queue.
+    _lock = done.catchError((_) {});
+    return done;
+  }
 
   /// The refresh token a refresh rotated to after [signOut] began. It is not
   /// stored, but it is the live one, so it is the one to revoke.
@@ -324,7 +337,19 @@ class ChatGptAuth extends ChangeNotifier {
     try {
       final raw = await _secure.read(key: _kSession, iOptions: _apple, mOptions: _macos);
       if (generation != _generation) return;
-      if (raw != null && raw.isNotEmpty) {
+      if (raw != null && raw.isNotEmpty && !present) {
+        // Fails closed: every store writes the marker, so a record without it
+        // is one a sign-out could not delete (or a reinstall's leftover).
+        await _serialized(() async {
+          if (generation != _generation) return; // a sign-in just committed
+          try {
+            await _secure.delete(key: _kSession, iOptions: _apple, mOptions: _macos);
+          } catch (_) {}
+        });
+        if (generation != _generation) return;
+        _session = null;
+        _unreadable = false;
+      } else if (raw != null && raw.isNotEmpty) {
         _session = ChatGptSession.fromJson(jsonDecode(raw) as Map);
         _unreadable = false;
       } else if (trusted || !present) {
@@ -341,35 +366,36 @@ class ChatGptAuth extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// A refresh passes the [generation] it started under: if the session was
-  /// signed out or replaced since, its result is dropped before anything is
-  /// written. [signOut] waits for an in-flight refresh, so none can land after
-  /// it clears.
-  Future<void> _store(ChatGptSession? s, {int? generation}) async {
-    final prefs = await SharedPreferences.getInstance();
-    if (generation != null && generation != _generation) {
-      throw ChatGptException('Signed out.');
-    }
-    if (s == null) {
-      await _secure.delete(key: _kSession, iOptions: _apple, mOptions: _macos);
-    } else {
-      final raw = jsonEncode(s.toJson());
-      try {
-        await _secure.write(key: _kSession, value: raw, iOptions: _apple, mOptions: _macos);
-      } on Object catch (e) {
-        // Only a leftover item from a previous install (see CoachConfig.save)
-        // is worth deleting; any other failure leaves the stored session alone.
-        if (!isKeychainDuplicateItemError(e)) rethrow;
-        await _secure.delete(key: _kSession, iOptions: _apple, mOptions: _macos);
-        await _secure.write(key: _kSession, value: raw, iOptions: _apple, mOptions: _macos);
-      }
-    }
-    await prefs.setBool(_kPresent, s != null);
-    if (generation == null) _generation++;
-    _session = s;
-    _unreadable = false;
-    notifyListeners();
-  }
+  /// Every caller passes the [generation] it started under, checked INSIDE the
+  /// lock before any write: if the session was signed out or replaced since,
+  /// the result is dropped. A sign-in or [debugSetSession] passes `commit` to
+  /// start a new generation once its write lands.
+  Future<void> _store(ChatGptSession? s, {required int generation, bool commit = false}) =>
+      _serialized(() async {
+        if (generation != _generation) throw ChatGptException('Signed out.');
+        final prefs = await SharedPreferences.getInstance();
+        if (s == null) {
+          await _secure.delete(key: _kSession, iOptions: _apple, mOptions: _macos);
+        } else {
+          final raw = jsonEncode(s.toJson());
+          try {
+            await _secure.write(key: _kSession, value: raw, iOptions: _apple, mOptions: _macos);
+          } on Object catch (e) {
+            // Only a leftover item from a previous install (see CoachConfig.save)
+            // is worth deleting; any other failure leaves the stored session alone.
+            if (!isKeychainDuplicateItemError(e)) rethrow;
+            await _secure.delete(key: _kSession, iOptions: _apple, mOptions: _macos);
+            await _secure.write(key: _kSession, value: raw, iOptions: _apple, mOptions: _macos);
+          }
+        }
+        await prefs.setBool(_kPresent, s != null);
+        // A sign-out that began mid-write clears the keychain right after us.
+        if (generation != _generation) throw ChatGptException('Signed out.');
+        if (commit) _generation++;
+        _session = s;
+        _unreadable = false;
+        notifyListeners();
+      });
 
   static String _random() {
     final r = Random.secure();
@@ -380,6 +406,7 @@ class ChatGptAuth extends ChangeNotifier {
   /// this app alive while it is up (an in-app browser), because the redirect
   /// lands on a listener on this device's loopback.
   Future<void> signIn(Future<bool> Function(Uri) open) async {
+    final generation = _generation;
     final prefs = await SharedPreferences.getInstance();
     final hostId = prefs.getString(_kHostId) ?? 'urn:uuid:${const Uuid().v4()}';
     await prefs.setString(_kHostId, hostId);
@@ -437,7 +464,11 @@ class ChatGptAuth extends ChangeNotifier {
       final idToken = t['id_token'] as String?;
       if (idToken == null) throw ChatGptException('ChatGPT returned no identity.');
       final who = chatGptIdentity(idToken, clientId: clientId, nonce: nonce);
-      await _store(_sessionFrom(t, sub: who.sub, email: who.email, idToken: idToken));
+      await _store(
+        _sessionFrom(t, sub: who.sub, email: who.email, idToken: idToken),
+        generation: generation,
+        commit: true,
+      );
     } finally {
       if (identical(_pending, server)) _pending = null;
       await server.close(force: true);
@@ -545,7 +576,13 @@ class ChatGptAuth extends ChangeNotifier {
       _rotatedAfterSignOut = next.refreshToken;
       throw ChatGptException('Signed out.');
     }
-    await _store(next, generation: generation);
+    try {
+      await _store(next, generation: generation);
+    } catch (_) {
+      // Signed out while it was writing: the rotated token is the live one.
+      if (generation != _generation) _rotatedAfterSignOut = next.refreshToken;
+      rethrow;
+    }
     return next.accessToken;
   }
 
@@ -554,17 +591,18 @@ class ChatGptAuth extends ChangeNotifier {
   /// the user can still disconnect the app in ChatGPT settings.
   Future<bool> signOut() async {
     _generation++; // before any await: see [_generation]
-    // An in-flight refresh may have rotated the token; revoke the latest one.
-    try {
-      await _refreshing;
-    } catch (_) {}
+    cancelSignIn();
     final s = _session;
-    final token = _rotatedAfterSignOut ?? s?.refreshToken;
-    _rotatedAfterSignOut = null;
     // Memory first, so nothing keeps using the session while revocation is out.
     _session = null;
     _unreadable = false;
     notifyListeners();
+    // An in-flight refresh may have rotated the token; revoke the latest one.
+    try {
+      await _refreshing;
+    } catch (_) {}
+    final token = _rotatedAfterSignOut ?? s?.refreshToken;
+    _rotatedAfterSignOut = null;
     final prefs = await SharedPreferences.getInstance();
     final clientId = prefs.getString(_kClientId);
     var revoked = token == null;
@@ -578,27 +616,34 @@ class ChatGptAuth extends ChangeNotifier {
         revoked = r.statusCode == 200;
       } catch (_) {}
     }
-    // Signed out either way. If the delete fails the item may linger, but its
-    // token was just revoked, so a later load just ends it at the next refresh.
-    try {
-      await _secure.delete(key: _kSession, iOptions: _apple, mOptions: _macos);
-    } catch (_) {}
-    await prefs.setBool(_kPresent, false);
+    // Signed out either way. If the delete fails the item may linger, but the
+    // marker is cleared and [load] fails closed on a record without it, so it
+    // is never restored (it is deleted then); the credential is not guaranteed
+    // gone until that happens.
+    await _serialized(() async {
+      try {
+        await _secure.delete(key: _kSession, iOptions: _apple, mOptions: _macos);
+      } catch (_) {}
+      await prefs.setBool(_kPresent, false);
+    });
     return revoked;
   }
 
   /// "Reset all data": the session plus the registration and welcome flag.
   Future<void> forgetAll() async {
     _generation++;
+    cancelSignIn();
     _session = null;
     _unreadable = false;
-    try {
-      await _secure.delete(key: _kSession, iOptions: _apple, mOptions: _macos);
-    } catch (_) {}
-    final prefs = await SharedPreferences.getInstance();
-    for (final k in [_kClientId, _kHostId, _kPresent, _kWelcomed]) {
-      await prefs.remove(k);
-    }
+    await _serialized(() async {
+      try {
+        await _secure.delete(key: _kSession, iOptions: _apple, mOptions: _macos);
+      } catch (_) {}
+      final prefs = await SharedPreferences.getInstance();
+      for (final k in [_kClientId, _kHostId, _kPresent, _kWelcomed]) {
+        await prefs.remove(k);
+      }
+    });
     notifyListeners();
   }
 
@@ -631,7 +676,8 @@ class ChatGptAuth extends ChangeNotifier {
   }
 
   @visibleForTesting
-  Future<void> debugSetSession(ChatGptSession? s) => _store(s);
+  Future<void> debugSetSession(ChatGptSession? s) =>
+      _store(s, generation: _generation, commit: true);
 }
 
 class _TokenError implements Exception {

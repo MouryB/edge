@@ -69,9 +69,11 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   const channel = MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
   late Map<String, String> keychain;
+  Completer<void>? writeGate; // hangs keychain writes until completed
 
   setUp(() {
     keychain = {};
+    writeGate = null;
     SharedPreferences.setMockInitialValues({});
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (call) async {
@@ -80,6 +82,7 @@ void main() {
         case 'read':
           return keychain[args['key']];
         case 'write':
+          await writeGate?.future;
           keychain[args['key'] as String] = args['value'] as String;
         case 'delete':
           keychain.remove(args['key']);
@@ -177,6 +180,50 @@ void main() {
       expect(second.queryParameters['ext_agent_host_id'], q['ext_agent_host_id']);
       expect(second.queryParameters.containsKey('agent_name_hint'), isFalse);
       expect(second.queryParameters['id_token_hint'], isNotNull);
+    });
+
+    test('sign-out while the code exchange is pending leaves nothing stored', () async {
+      final gate = Completer<void>(), arrived = Completer<void>();
+      late Uri first;
+      auth = ChatGptAuth(client: MockClient((req) async {
+        arrived.complete();
+        await gate.future;
+        return http.Response(
+            jsonEncode({
+              'access_token': 'at-1',
+              'refresh_token': 'rt-1',
+              'id_token': _idToken(req.bodyFields['client_id']!, first.queryParameters['nonce']!),
+              'scope': _fullScope,
+            }),
+            200);
+      }));
+      final signIn = expectLater(
+          auth.signIn((u) {
+            first = u;
+            return browser(u, clientId: 'oaiapp_1');
+          }),
+          throwsA(isA<ChatGptException>()));
+      await arrived.future;
+      await auth.signOut();
+      gate.complete();
+      await signIn;
+      expect(auth.signedIn, isFalse);
+      expect(keychain, isEmpty);
+    });
+
+    test('a sign-in already writing when sign-out starts is cleared afterwards', () async {
+      writeGate = Completer<void>();
+      final auth = ChatGptAuth();
+      final store = expectLater(auth.debugSetSession(_session()), throwsA(isA<ChatGptException>()));
+      await pumpEventQueue();
+      final out = auth.signOut();
+      await pumpEventQueue();
+      writeGate!.complete();
+      await out;
+      await store;
+      expect(auth.signedIn, isFalse);
+      expect(keychain, isEmpty);
+      expect((await SharedPreferences.getInstance()).getBool('coach_chatgpt_present'), isFalse);
     });
 
     test('a declined consent ends sign-in without a token exchange', () async {
@@ -406,6 +453,17 @@ void main() {
       expect(auth.session!.accessToken, 'at-1');
       expect(keychain.values.single, stored);
     });
+
+    for (final prefs in [<String, Object>{'coach_chatgpt_present': false}, <String, Object>{}]) {
+      test('load drops a keychain record the present marker does not vouch for ($prefs)', () async {
+        SharedPreferences.setMockInitialValues(prefs);
+        keychain['coach_chatgpt_session'] = jsonEncode(_session().toJson());
+        final auth = ChatGptAuth();
+        await auth.load(trusted: true);
+        expect(auth.signedIn, isFalse);
+        expect(keychain, isEmpty);
+      });
+    }
 
     test('forgetAll clears the session, registration and welcome flag; welcome shows once', () async {
       SharedPreferences.setMockInitialValues({
