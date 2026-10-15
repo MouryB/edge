@@ -391,7 +391,11 @@ class ChatGptAuth extends ChangeNotifier {
         await prefs.setBool(_kPresent, s != null);
         // A sign-out that began mid-write clears the keychain right after us.
         if (generation != _generation) throw ChatGptException('Signed out.');
-        if (commit) _generation++;
+        if (commit) {
+          _generation++;
+          // A new session: an earlier one's rotated token is not this one's.
+          _rotatedAfterSignOut = null;
+        }
         _session = s;
         _unreadable = false;
         notifyListeners();
@@ -635,6 +639,13 @@ class ChatGptAuth extends ChangeNotifier {
     cancelSignIn();
     _session = null;
     _unreadable = false;
+    // An in-flight refresh parks its rotated token for a sign-out to revoke;
+    // with the registration forgotten there is nothing to revoke it with, and
+    // left behind it would be revoked in place of a later session's token.
+    try {
+      await _refreshing;
+    } catch (_) {}
+    _rotatedAfterSignOut = null;
     await _serialized(() async {
       try {
         await _secure.delete(key: _kSession, iOptions: _apple, mOptions: _macos);

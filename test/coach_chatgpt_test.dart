@@ -432,6 +432,40 @@ void main() {
       expect(revoked, ['rt-2'], reason: 'the rotated token is the live one');
     });
 
+    test('a reset during a refresh does not make a later sign-out revoke the stale token', () async {
+      SharedPreferences.setMockInitialValues({'coach_chatgpt_client_id': 'oaiapp_1'});
+      final gate = Completer<void>();
+      final revoked = <String>[];
+      final auth = ChatGptAuth(client: MockClient((req) async {
+        if (req.url.path.endsWith('/revoke')) {
+          revoked.add(req.bodyFields['token']!);
+          return http.Response('', 200);
+        }
+        await gate.future;
+        return http.Response(
+            jsonEncode({'access_token': 'at-2', 'refresh_token': 'rt-2', 'expires_in': 3600}), 200);
+      }));
+      await auth.debugSetSession(_session(expiresAt: DateTime.now()));
+      final refreshed = expectLater(auth.accessToken(), throwsA(isA<ChatGptException>()));
+      await pumpEventQueue();
+      final reset = auth.forgetAll();
+      gate.complete();
+      await reset;
+      await refreshed;
+      // Signed in again, then out: the new session's token is the one revoked.
+      (await SharedPreferences.getInstance()).setString('coach_chatgpt_client_id', 'oaiapp_2');
+      await auth.debugSetSession(ChatGptSession(
+          sub: 'user-1',
+          email: 'me@example.com',
+          idToken: 'i',
+          accessToken: 'at-new',
+          refreshToken: 'rt-new',
+          scope: _fullScope,
+          expiresAt: DateTime.now().add(const Duration(hours: 1))));
+      await auth.signOut();
+      expect(revoked, ['rt-new']);
+    });
+
     test('a non-duplicate keychain write failure leaves the stored session alone', () async {
       final auth = ChatGptAuth();
       await auth.debugSetSession(_session());
