@@ -466,6 +466,24 @@ void main() {
       expect(revoked, ['rt-new']);
     });
 
+    test('a sign-in during a slow sign-out survives it', () async {
+      SharedPreferences.setMockInitialValues({'coach_chatgpt_client_id': 'oaiapp_1'});
+      final gate = Completer<void>();
+      final auth = ChatGptAuth(client: MockClient((req) async {
+        await gate.future; // revocation still out
+        return http.Response('', 200);
+      }));
+      await auth.debugSetSession(_session());
+      final out = auth.signOut();
+      await pumpEventQueue();
+      await auth.debugSetSession(_session(scope: '$_fullScope x')); // signed back in
+      gate.complete();
+      await out;
+      expect(auth.signedIn, isTrue);
+      expect(keychain, isNotEmpty);
+      expect((await SharedPreferences.getInstance()).getBool('coach_chatgpt_present'), isTrue);
+    });
+
     test('a non-duplicate keychain write failure leaves the stored session alone', () async {
       final auth = ChatGptAuth();
       await auth.debugSetSession(_session());

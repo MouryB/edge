@@ -594,7 +594,7 @@ class ChatGptAuth extends ChangeNotifier {
   /// revocation could not be confirmed; the tokens are cleared regardless, and
   /// the user can still disconnect the app in ChatGPT settings.
   Future<bool> signOut() async {
-    _generation++; // before any await: see [_generation]
+    final generation = ++_generation; // before any await: see [_generation]
     cancelSignIn();
     final s = _session;
     // Memory first, so nothing keeps using the session while revocation is out.
@@ -625,6 +625,9 @@ class ChatGptAuth extends ChangeNotifier {
     // is never restored (it is deleted then); the credential is not guaranteed
     // gone until that happens.
     await _serialized(() async {
+      // The button to sign in again is back while revocation is out: a sign-in
+      // that committed since (or a later sign-out) owns the keychain now.
+      if (generation != _generation) return;
       try {
         await _secure.delete(key: _kSession, iOptions: _apple, mOptions: _macos);
       } catch (_) {}
