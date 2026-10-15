@@ -130,6 +130,9 @@ void main() {
           client: MockClient((req) async {
             expect(req.url.toString(), '$kChatGptIssuer/api/accounts/oauth/token');
             tokenForms.add(req.bodyFields);
+            if (req.bodyFields['grant_type'] == 'authorization_code') {
+              expect(req.bodyFields['code'], 'code-1');
+            }
             return http.Response(
               jsonEncode({
                 'access_token': 'at-1',
@@ -147,13 +150,10 @@ void main() {
       late Uri first, second;
       auth = makeAuth(() => (second.hasQuery ? second : first).queryParameters['nonce']!);
       second = Uri();
-      expect(
-        await auth.signIn((u) {
-          first = u;
-          return browser(u, clientId: 'oaiapp_1');
-        }),
-        isTrue,
-      );
+      await auth.signIn((u) {
+        first = u;
+        return browser(u, clientId: 'oaiapp_1');
+      });
       final q = first.queryParameters;
       expect(q['client_id'], 'dynamic_agent_client');
       expect(q['agent_name_hint'], 'OpenStrap Edge');
@@ -169,13 +169,10 @@ void main() {
       expect(auth.session!.email, 'me@example.com');
 
       // Returning sign-in: the saved client id and host id, no name hint.
-      expect(
-        await auth.signIn((u) {
-          second = u;
-          return browser(u);
-        }),
-        isFalse,
-      );
+      await auth.signIn((u) {
+        second = u;
+        return browser(u);
+      });
       expect(second.queryParameters['client_id'], 'oaiapp_1');
       expect(second.queryParameters['ext_agent_host_id'], q['ext_agent_host_id']);
       expect(second.queryParameters.containsKey('agent_name_hint'), isFalse);
@@ -299,7 +296,30 @@ void main() {
       expect(reply['content'], 'hello');
     });
 
+    test('output comes from output_item.done when completed.output is empty', () async {
+      Map<String, Object?> done(int i, Map<String, Object?> item) =>
+          {'type': 'response.output_item.done', 'output_index': i, 'item': item};
+      Map<String, Object?> empty() => {
+            'type': 'response.completed',
+            'response': {'status': 'completed', 'output': []},
+          };
+      final message = (_completed('hello')['response'] as Map)['output'][0] as Map<String, Object?>;
+      var reply = await post(MockClient(
+          (_) async => http.Response(_sse([done(0, message), empty()]), 200)));
+      expect(reply['content'], 'hello');
+      reply = await post(MockClient((_) async => http.Response(
+          _sse([
+            done(1, {'type': 'function_call', 'call_id': 'c1', 'name': 'f', 'arguments': '{}', 'status': 'completed'}),
+            done(0, message),
+            empty(),
+          ]),
+          200)));
+      expect(reply['content'], 'hello');
+      expect((reply['tool_calls'] as List).single['id'], 'c1');
+    });
+
     test('usage limit, mid-stream failure and a cut-off stream are errors, never a fallback', () async {
+      await cfg.save(apiKey: 'sk-test');
       for (final (status, body, expected) in [
         (
           429,
@@ -318,16 +338,90 @@ void main() {
         ),
         (200, _sse([{'type': 'response.output_text.delta', 'delta': 'he'}]), 'ended early'),
       ]) {
+        final sent = <http.Request>[];
         await expectLater(
-          post(MockClient((_) async => http.Response(body, status))),
+          post(MockClient((req) async {
+            sent.add(req);
+            return http.Response(body, status);
+          })),
           throwsA(isA<CoachException>().having((e) => e.message, 'message', contains(expected))),
         );
+        expect(sent, hasLength(1), reason: 'no fallback request');
+        expect(sent.single.headers['Authorization'], 'Bearer at-1');
       }
     });
 
     test('signed in without plan usage is not configured', () async {
       await cfg.chatgpt.debugSetSession(_session(scope: 'openid email profile offline_access'));
       expect(cfg.configured, isFalse);
+    });
+  });
+
+  group('session lifecycle', () {
+    test('sign-out during an in-flight refresh does not resurrect the session', () async {
+      SharedPreferences.setMockInitialValues({'coach_chatgpt_client_id': 'oaiapp_1'});
+      final gate = Completer<void>();
+      final revoked = <String>[];
+      final auth = ChatGptAuth(client: MockClient((req) async {
+        if (req.url.path.endsWith('/revoke')) {
+          revoked.add(req.bodyFields['token']!);
+          return http.Response('', 200);
+        }
+        await gate.future;
+        return http.Response(
+            jsonEncode({'access_token': 'at-2', 'refresh_token': 'rt-2', 'expires_in': 3600}), 200);
+      }));
+      await auth.debugSetSession(_session(expiresAt: DateTime.now()));
+      final refresh = auth.accessToken();
+      final refreshed = expectLater(refresh, throwsA(isA<ChatGptException>()));
+      await pumpEventQueue();
+      final out = auth.signOut();
+      await pumpEventQueue();
+      gate.complete();
+      expect(await out, isTrue);
+      await refreshed;
+      expect(auth.signedIn, isFalse);
+      expect(keychain, isEmpty);
+      expect(revoked, ['rt-2'], reason: 'the rotated token is the live one');
+    });
+
+    test('a non-duplicate keychain write failure leaves the stored session alone', () async {
+      final auth = ChatGptAuth();
+      await auth.debugSetSession(_session());
+      final stored = keychain.values.single;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        if (call.method == 'write') throw PlatformException(code: 'boom', message: 'disk full');
+        fail('${call.method} must not run');
+      });
+      await expectLater(
+          auth.debugSetSession(ChatGptSession(
+              sub: 'user-1',
+              email: 'me@example.com',
+              idToken: 'i',
+              accessToken: 'at-9',
+              refreshToken: 'rt-9',
+              scope: _fullScope,
+              expiresAt: DateTime.now().add(const Duration(hours: 1)))), throwsA(isA<PlatformException>()));
+      expect(auth.session!.accessToken, 'at-1');
+      expect(keychain.values.single, stored);
+    });
+
+    test('forgetAll clears the session, registration and welcome flag; welcome shows once', () async {
+      SharedPreferences.setMockInitialValues({
+        'coach_chatgpt_client_id': 'oaiapp_1',
+        'coach_chatgpt_host_id': 'urn:uuid:h',
+      });
+      final auth = ChatGptAuth();
+      await auth.debugSetSession(_session());
+      expect(await auth.takeWelcome(), isTrue);
+      expect(await auth.takeWelcome(), isFalse);
+      await auth.forgetAll();
+      final prefs = await SharedPreferences.getInstance();
+      expect(auth.signedIn, isFalse);
+      expect(keychain, isEmpty);
+      expect(prefs.getKeys().where((k) => k.startsWith('coach_chatgpt_')), isEmpty);
+      expect(await auth.takeWelcome(), isTrue);
     });
   });
 

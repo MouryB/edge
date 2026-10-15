@@ -689,8 +689,11 @@ class CoachEngine {
     final apiBase = config.apiBase;
     final chatgpt = config.usesChatGpt;
     // Replayed reasoning is tied to who paid for it, so a ChatGPT-plan turn
-    // never replays an API-key turn's output on the same base, or vice versa.
-    final replayBase = chatgpt ? '$apiBase#chatgpt' : apiBase;
+    // never replays an API-key turn's output on the same base, or another
+    // account's, or vice versa.
+    final replayBase = chatgpt
+        ? '$apiBase#chatgpt:${config.chatgpt.session?.sub ?? ''}'
+        : apiBase;
     try {
       body = switch (api) {
         CoachApi.responses => CoachResponses.request(body, apiBase: replayBase),

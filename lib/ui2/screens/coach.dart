@@ -1024,7 +1024,7 @@ class _CoachSetupState extends State<CoachSetup> {
       _msg = null;
     });
     try {
-      final first = await chatgpt.signIn(
+      await chatgpt.signIn(
         (uri) => launchUrl(uri, mode: LaunchMode.inAppBrowserView),
       );
       await _closeBrowser();
@@ -1039,7 +1039,7 @@ class _CoachSetupState extends State<CoachSetup> {
         }
       });
       if (!chatgpt.sharing) return;
-      if (first) await _welcome();
+      if (await chatgpt.takeWelcome() && mounted) await _welcome();
       if (mounted) await _fetch();
     } catch (e) {
       await _closeBrowser();

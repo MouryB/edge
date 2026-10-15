@@ -33,8 +33,10 @@ models** and pick one, then **Save**.
   switches to an API key.
 - Your questions and the rows the coach reads go to OpenAI under your ChatGPT
   account, exactly as with an OpenAI API key.
-- **Sign out of ChatGPT** revokes the sign-in. The coach then stays off until
-  you sign in again or pick another provider.
+- **Sign out of ChatGPT** asks OpenAI to revoke the sign-in and clears it from
+  the phone. If the app says revocation wasn't confirmed, also disconnect
+  OpenStrap in ChatGPT settings. The coach then stays off until you sign in
+  again or pick another provider.
 
 ## Setup with an API key
 

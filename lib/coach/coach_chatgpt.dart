@@ -13,6 +13,7 @@ import 'dart:math';
 import 'package:clock/clock.dart';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show PlatformException;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -33,6 +34,20 @@ const _revokeUrl = '$kChatGptIssuer/api/accounts/oauth/revoke';
 const _scopes =
     'openid profile email offline_access resource.invoke $kChatGptPlanScope';
 const _agentName = 'OpenStrap Edge';
+
+/// True for the iOS/macOS errSecDuplicateItem shape the plugin surfaces when
+/// its own check-then-act (containsKey -> update, else add) still lands on
+/// top of an item it did not find — a leftover from a prior install is the
+/// reported real-world trigger, since Keychain items routinely outlive an app
+/// uninstall while everything else this app stores does not.
+bool isKeychainDuplicateItemError(Object e) {
+  if (e is! PlatformException) return false;
+  final details = e.details;
+  if (details is int && details == -25299) return true;
+  final text = '${e.message ?? ''} ${e.details ?? ''}';
+  return text.contains('-25299') ||
+      text.contains('already exists in the keychain');
+}
 
 /// A sign-in or token failure with a message fit to show the user.
 class ChatGptException implements Exception {
@@ -104,10 +119,13 @@ String chatGptCodeChallenge(String verifier) =>
 }
 
 /// The final `response` of a streamed Responses call. This route only
-/// streams; the whole body is buffered and the completed response — which
-/// carries the full output — is handed to the same parser as non-streamed
-/// replies. Anything short of `response.completed` is a failure.
+/// streams; the whole body is buffered and the completed response is handed
+/// to the same parser as non-streamed replies. `response.completed` is the
+/// success signal, but on this route its `output` can be empty — the items
+/// arrive earlier as `response.output_item.done`, so they are taken from
+/// there. Anything short of `response.completed` is a failure.
 Map<String, dynamic> chatGptCompletedResponse(String sse) {
+  final items = <(int, Map<String, dynamic>)>[];
   for (final line in const LineSplitter().convert(sse)) {
     if (!line.startsWith('data:')) continue;
     final Object? event;
@@ -118,9 +136,19 @@ Map<String, dynamic> chatGptCompletedResponse(String sse) {
     }
     if (event is! Map) continue;
     switch (event['type']) {
+      case 'response.output_item.done':
+        final item = event['item'];
+        if (item is Map) {
+          final i = event['output_index'];
+          items.add((i is int ? i : items.length, item.cast<String, dynamic>()));
+        }
       case 'response.completed':
         final r = event['response'];
-        if (r is Map) return r.cast<String, dynamic>();
+        if (r is! Map) break;
+        final out = r['output'];
+        if (out is List && out.isNotEmpty) return r.cast<String, dynamic>();
+        items.sort((a, b) => a.$1.compareTo(b.$1));
+        return {...r.cast<String, dynamic>(), 'output': [for (final e in items) e.$2]};
       case 'response.failed' || 'error':
         final err = (event['response'] is Map ? event['response']['error'] : null) ??
             event['error'] ??
@@ -246,6 +274,7 @@ class ChatGptAuth extends ChangeNotifier {
   static const _kClientId = 'coach_chatgpt_client_id';
   static const _kHostId = 'coach_chatgpt_host_id';
   static const _kPresent = 'coach_chatgpt_present';
+  static const _kWelcomed = 'coach_chatgpt_welcomed';
   static const _kSession = 'coach_chatgpt_session'; // secure storage
 
   // Same first-unlock reasoning as CoachConfig's key: background relaunches
@@ -259,6 +288,17 @@ class ChatGptAuth extends ChangeNotifier {
   bool _unreadable = false;
   HttpServer? _pending;
   Future<String>? _refreshing;
+
+  /// Bumped whenever a sign-in commits a session, and at the very start of
+  /// [signOut]/[forgetAll]. A [load] or [_refresh] that started under an older
+  /// value must not apply its result — a slow keychain read or token call
+  /// would otherwise bring back a session the user just ended (same idea as
+  /// CoachConfig._generation).
+  int _generation = 0;
+
+  /// The refresh token a refresh rotated to after [signOut] began. It is not
+  /// stored, but it is the live one, so it is the one to revoke.
+  String? _rotatedAfterSignOut;
 
   ChatGptSession? get session => _session;
   bool get signedIn => _session != null;
@@ -278,10 +318,12 @@ class ChatGptAuth extends ChangeNotifier {
   }
 
   Future<void> load({bool trusted = false}) async {
+    final generation = _generation;
     final prefs = await SharedPreferences.getInstance();
     final present = prefs.getBool(_kPresent) ?? false;
     try {
       final raw = await _secure.read(key: _kSession, iOptions: _apple, mOptions: _macos);
+      if (generation != _generation) return;
       if (raw != null && raw.isNotEmpty) {
         _session = ChatGptSession.fromJson(jsonDecode(raw) as Map);
         _unreadable = false;
@@ -293,26 +335,37 @@ class ChatGptAuth extends ChangeNotifier {
         _unreadable = true;
       }
     } catch (_) {
+      if (generation != _generation) return;
       _unreadable = present && _session == null;
     }
     notifyListeners();
   }
 
-  Future<void> _store(ChatGptSession? s) async {
+  /// A refresh passes the [generation] it started under: if the session was
+  /// signed out or replaced since, its result is dropped before anything is
+  /// written. [signOut] waits for an in-flight refresh, so none can land after
+  /// it clears.
+  Future<void> _store(ChatGptSession? s, {int? generation}) async {
     final prefs = await SharedPreferences.getInstance();
+    if (generation != null && generation != _generation) {
+      throw ChatGptException('Signed out.');
+    }
     if (s == null) {
       await _secure.delete(key: _kSession, iOptions: _apple, mOptions: _macos);
     } else {
       final raw = jsonEncode(s.toJson());
       try {
         await _secure.write(key: _kSession, value: raw, iOptions: _apple, mOptions: _macos);
-      } catch (_) {
-        // A leftover item from a previous install (see CoachConfig.save).
+      } on Object catch (e) {
+        // Only a leftover item from a previous install (see CoachConfig.save)
+        // is worth deleting; any other failure leaves the stored session alone.
+        if (!isKeychainDuplicateItemError(e)) rethrow;
         await _secure.delete(key: _kSession, iOptions: _apple, mOptions: _macos);
         await _secure.write(key: _kSession, value: raw, iOptions: _apple, mOptions: _macos);
       }
     }
     await prefs.setBool(_kPresent, s != null);
+    if (generation == null) _generation++;
     _session = s;
     _unreadable = false;
     notifyListeners();
@@ -325,9 +378,8 @@ class ChatGptAuth extends ChangeNotifier {
 
   /// Runs the browser sign-in. [open] shows the authorize page and must keep
   /// this app alive while it is up (an in-app browser), because the redirect
-  /// lands on a listener on this device's loopback. Returns true for a first
-  /// registration, which is when the welcome note is due.
-  Future<bool> signIn(Future<bool> Function(Uri) open) async {
+  /// lands on a listener on this device's loopback.
+  Future<void> signIn(Future<bool> Function(Uri) open) async {
     final prefs = await SharedPreferences.getInstance();
     final hostId = prefs.getString(_kHostId) ?? 'urn:uuid:${const Uuid().v4()}';
     await prefs.setString(_kHostId, hostId);
@@ -386,7 +438,6 @@ class ChatGptAuth extends ChangeNotifier {
       if (idToken == null) throw ChatGptException('ChatGPT returned no identity.');
       final who = chatGptIdentity(idToken, clientId: clientId, nonce: nonce);
       await _store(_sessionFrom(t, sub: who.sub, email: who.email, idToken: idToken));
-      return savedClientId == null;
     } finally {
       if (identical(_pending, server)) _pending = null;
       await server.close(force: true);
@@ -461,6 +512,7 @@ class ChatGptAuth extends ChangeNotifier {
   }
 
   Future<String> _refresh(ChatGptSession s) async {
+    final generation = _generation;
     final prefs = await SharedPreferences.getInstance();
     final clientId = prefs.getString(_kClientId);
     if (clientId == null) throw ChatGptException('Sign in with ChatGPT again.');
@@ -475,7 +527,7 @@ class ChatGptAuth extends ChangeNotifier {
       if (!e.terminal) {
         throw ChatGptException('Could not renew the ChatGPT sign-in (${e.status}). Try again.');
       }
-      await _store(null);
+      await _store(null, generation: generation);
       throw ChatGptException('Your ChatGPT sign-in has ended. Sign in again from AI settings.');
     } catch (e) {
       // A network hiccup is not a revoked session — the tokens stay.
@@ -487,7 +539,13 @@ class ChatGptAuth extends ChangeNotifier {
       email: s.email,
       idToken: (t['id_token'] as String?) ?? s.idToken,
     );
-    await _store(next);
+    if (generation != _generation) {
+      // Signed out while the call was out: do not bring the session back, but
+      // the rotated token is the live one and [signOut] has to revoke it.
+      _rotatedAfterSignOut = next.refreshToken;
+      throw ChatGptException('Signed out.');
+    }
+    await _store(next, generation: generation);
     return next.accessToken;
   }
 
@@ -495,21 +553,61 @@ class ChatGptAuth extends ChangeNotifier {
   /// revocation could not be confirmed; the tokens are cleared regardless, and
   /// the user can still disconnect the app in ChatGPT settings.
   Future<bool> signOut() async {
+    _generation++; // before any await: see [_generation]
+    // An in-flight refresh may have rotated the token; revoke the latest one.
+    try {
+      await _refreshing;
+    } catch (_) {}
     final s = _session;
-    final clientId = (await SharedPreferences.getInstance()).getString(_kClientId);
-    var revoked = s == null;
-    if (s != null && clientId != null) {
+    final token = _rotatedAfterSignOut ?? s?.refreshToken;
+    _rotatedAfterSignOut = null;
+    // Memory first, so nothing keeps using the session while revocation is out.
+    _session = null;
+    _unreadable = false;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    final clientId = prefs.getString(_kClientId);
+    var revoked = token == null;
+    if (token != null && clientId != null) {
       try {
         final r = await _http((c) => c.post(Uri.parse(_revokeUrl), body: {
-              'token': s.refreshToken,
+              'token': token,
               'token_type_hint': 'refresh_token',
               'client_id': clientId,
             }).timeout(const Duration(seconds: 15)));
         revoked = r.statusCode == 200;
       } catch (_) {}
     }
-    await _store(null);
+    // Signed out either way. If the delete fails the item may linger, but its
+    // token was just revoked, so a later load just ends it at the next refresh.
+    try {
+      await _secure.delete(key: _kSession, iOptions: _apple, mOptions: _macos);
+    } catch (_) {}
+    await prefs.setBool(_kPresent, false);
     return revoked;
+  }
+
+  /// "Reset all data": the session plus the registration and welcome flag.
+  Future<void> forgetAll() async {
+    _generation++;
+    _session = null;
+    _unreadable = false;
+    try {
+      await _secure.delete(key: _kSession, iOptions: _apple, mOptions: _macos);
+    } catch (_) {}
+    final prefs = await SharedPreferences.getInstance();
+    for (final k in [_kClientId, _kHostId, _kPresent, _kWelcomed]) {
+      await prefs.remove(k);
+    }
+    notifyListeners();
+  }
+
+  /// True exactly once, on the first sign-in that has plan usage.
+  Future<bool> takeWelcome() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (prefs.getBool(_kWelcomed) ?? false) return false;
+    await prefs.setBool(_kWelcomed, true);
+    return true;
   }
 
   /// Model slugs this account may use, in the server's order.

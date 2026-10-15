@@ -3,8 +3,9 @@
 // SharedPreferences. NOTHING here ever touches our backend — the key stays on the
 // device and the app calls the OpenAI-compatible provider directly.
 
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart' show PlatformException;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -119,20 +120,6 @@ bool isPrivateCoachHost(String url) {
   } on FormatException {
     return null;
   }
-}
-
-/// True for the iOS/macOS errSecDuplicateItem shape the plugin surfaces when
-/// its own check-then-act (containsKey -> update, else add) still lands on
-/// top of an item it did not find — a leftover from a prior install is the
-/// reported real-world trigger, since Keychain items routinely outlive an app
-/// uninstall while everything else this app stores does not.
-bool _isDuplicateItemError(Object e) {
-  if (e is! PlatformException) return false;
-  final details = e.details;
-  if (details is int && details == -25299) return true;
-  final text = '${e.message ?? ''} ${e.details ?? ''}';
-  return text.contains('-25299') ||
-      text.contains('already exists in the keychain');
 }
 
 class CoachConfig extends ChangeNotifier {
@@ -316,9 +303,9 @@ class CoachConfig extends ChangeNotifier {
   /// device unlocked — the only condition under which an EMPTY read is real
   /// evidence about what is stored.
   Future<void> load({bool trusted = false}) async {
-    // Its own keychain item, read alongside the key rather than ahead of it so
-    // one hung read cannot hold up the other.
-    final chatgptLoad = chatgpt.load(trusted: trusted).catchError((_) {});
+    // Its own keychain item, and not awaited: a hung read of it must not hold
+    // back the BYOK settings. It notifies its own listeners, which are forwarded.
+    unawaited(chatgpt.load(trusted: trusted).catchError((_) {}));
     final prefs = await SharedPreferences.getInstance();
     _useChatGpt = prefs.getBool(_kUseChatGpt) ?? false;
     _baseUrl = prefs.getString(_kBaseUrl) ?? defaultBaseUrl;
@@ -408,7 +395,6 @@ class CoachConfig extends ChangeNotifier {
       _keyUnreadable = marker == true;
       _keyUndetermined = marker == null;
     }
-    await chatgptLoad;
     notifyListeners();
   }
 
@@ -488,7 +474,7 @@ class CoachConfig extends ChangeNotifier {
             // sitting there — delete it and retry once. A second failure is
             // rethrown as-is: this recovers the one known stale-item case, it
             // does not mask a keychain that is genuinely stuck.
-            if (!_isDuplicateItemError(e)) rethrow;
+            if (!isKeychainDuplicateItemError(e)) rethrow;
             await _secure.delete(key: _kKey, iOptions: _apple, mOptions: _macos);
             await _secure.write(
               key: _kKey,
