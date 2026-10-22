@@ -463,7 +463,8 @@ void main() {
           scope: _fullScope,
           expiresAt: DateTime.now().add(const Duration(hours: 1))));
       await auth.signOut();
-      expect(revoked, ['rt-new']);
+      // The reset revoked the rotated token; the sign-out revoked only its own.
+      expect(revoked, ['rt-2', 'rt-new']);
     });
 
     test('a sign-in during a slow sign-out survives it', () async {
@@ -517,21 +518,55 @@ void main() {
       });
     }
 
-    test('forgetAll clears the session, registration and welcome flag; welcome shows once', () async {
-      SharedPreferences.setMockInitialValues({
-        'coach_chatgpt_client_id': 'oaiapp_1',
-        'coach_chatgpt_host_id': 'urn:uuid:h',
+    for (final status in [200, 500]) {
+      test('forgetAll revokes, then clears the session, registration and welcome flag; '
+          'welcome shows once (revoke $status)', () async {
+        SharedPreferences.setMockInitialValues({
+          'coach_chatgpt_client_id': 'oaiapp_1',
+          'coach_chatgpt_host_id': 'urn:uuid:h',
+        });
+        final revoked = <String>[];
+        final auth = ChatGptAuth(client: MockClient((req) async {
+          expect(req.url.path, endsWith('/revoke'));
+          expect(req.bodyFields['client_id'], 'oaiapp_1');
+          revoked.add(req.bodyFields['token']!);
+          return http.Response('', status);
+        }));
+        await auth.debugSetSession(_session());
+        expect(await auth.takeWelcome(), isTrue);
+        expect(await auth.takeWelcome(), isFalse);
+        await auth.forgetAll();
+        final prefs = await SharedPreferences.getInstance();
+        expect(revoked, ['rt-1']);
+        expect(auth.signedIn, isFalse);
+        expect(keychain, isEmpty);
+        expect(prefs.getKeys().where((k) => k.startsWith('coach_chatgpt_')), isEmpty);
+        expect(await auth.takeWelcome(), isTrue);
       });
-      final auth = ChatGptAuth();
-      await auth.debugSetSession(_session());
-      expect(await auth.takeWelcome(), isTrue);
-      expect(await auth.takeWelcome(), isFalse);
-      await auth.forgetAll();
-      final prefs = await SharedPreferences.getInstance();
-      expect(auth.signedIn, isFalse);
-      expect(keychain, isEmpty);
-      expect(prefs.getKeys().where((k) => k.startsWith('coach_chatgpt_')), isEmpty);
-      expect(await auth.takeWelcome(), isTrue);
+    }
+
+    test('a refresh whose keychain write fails keeps the rotated token in memory', () async {
+      SharedPreferences.setMockInitialValues({'coach_chatgpt_client_id': 'oaiapp_1'});
+      final sent = <String>[];
+      var n = 0;
+      final auth = ChatGptAuth(client: MockClient((req) async {
+        sent.add(req.bodyFields['refresh_token']!);
+        n++;
+        return http.Response(
+            jsonEncode({'access_token': 'at-${n + 1}', 'refresh_token': 'rt-${n + 1}', 'expires_in': 1}),
+            200);
+      }));
+      await auth.debugSetSession(_session(expiresAt: DateTime.now()));
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        if (call.method == 'write') throw PlatformException(code: 'boom', message: 'disk full');
+        fail('${call.method} must not run');
+      });
+      expect(await auth.accessToken(), 'at-2');
+      expect(auth.session!.refreshToken, 'rt-2');
+      // Still expiring (expires_in: 1), so the next call refreshes again.
+      expect(await auth.accessToken(), 'at-3');
+      expect(sent, ['rt-1', 'rt-2'], reason: 'the spent token is never sent again');
     });
   });
 

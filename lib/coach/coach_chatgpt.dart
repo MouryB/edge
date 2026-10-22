@@ -583,9 +583,14 @@ class ChatGptAuth extends ChangeNotifier {
     try {
       await _store(next, generation: generation);
     } catch (_) {
-      // Signed out while it was writing: the rotated token is the live one.
-      if (generation != _generation) _rotatedAfterSignOut = next.refreshToken;
-      rethrow;
+      if (generation != _generation) {
+        // Signed out while it was writing: the rotated token is the live one.
+        _rotatedAfterSignOut = next.refreshToken;
+        rethrow;
+      }
+      // The keychain write failed, but the old refresh token is already spent:
+      // keep the rotated session in memory so the next refresh does not reuse it.
+      _session = next;
     }
     return next.accessToken;
   }
@@ -609,17 +614,7 @@ class ChatGptAuth extends ChangeNotifier {
     _rotatedAfterSignOut = null;
     final prefs = await SharedPreferences.getInstance();
     final clientId = prefs.getString(_kClientId);
-    var revoked = token == null;
-    if (token != null && clientId != null) {
-      try {
-        final r = await _http((c) => c.post(Uri.parse(_revokeUrl), body: {
-              'token': token,
-              'token_type_hint': 'refresh_token',
-              'client_id': clientId,
-            }).timeout(const Duration(seconds: 15)));
-        revoked = r.statusCode == 200;
-      } catch (_) {}
-    }
+    final revoked = token == null || (clientId != null && await _revoke(token, clientId));
     // Signed out either way. If the delete fails the item may linger, but the
     // marker is cleared and [load] fails closed on a record without it, so it
     // is never restored (it is deleted then); the credential is not guaranteed
@@ -636,19 +631,39 @@ class ChatGptAuth extends ChangeNotifier {
     return revoked;
   }
 
+  /// True when OpenAI confirmed the refresh token is revoked.
+  Future<bool> _revoke(String token, String clientId) async {
+    try {
+      final r = await _http((c) => c.post(Uri.parse(_revokeUrl), body: {
+            'token': token,
+            'token_type_hint': 'refresh_token',
+            'client_id': clientId,
+          }).timeout(const Duration(seconds: 15)));
+      return r.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// "Reset all data": the session plus the registration and welcome flag.
+  /// The session is revoked first, best effort, while the registration to
+  /// revoke it with is still here.
   Future<void> forgetAll() async {
     _generation++;
     cancelSignIn();
+    final s = _session;
     _session = null;
     _unreadable = false;
-    // An in-flight refresh parks its rotated token for a sign-out to revoke;
-    // with the registration forgotten there is nothing to revoke it with, and
-    // left behind it would be revoked in place of a later session's token.
+    // An in-flight refresh may have rotated the token; revoke the latest one.
+    // It is cleared here too: left behind, it would be revoked in place of a
+    // later session's token.
     try {
       await _refreshing;
     } catch (_) {}
+    final token = _rotatedAfterSignOut ?? s?.refreshToken;
     _rotatedAfterSignOut = null;
+    final clientId = (await SharedPreferences.getInstance()).getString(_kClientId);
+    if (token != null && clientId != null) await _revoke(token, clientId);
     await _serialized(() async {
       try {
         await _secure.delete(key: _kSession, iOptions: _apple, mOptions: _macos);
