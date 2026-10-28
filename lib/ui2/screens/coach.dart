@@ -1246,7 +1246,7 @@ class _CoachSetupState extends State<CoachSetup> {
       const SizedBox(height: S.x3),
       Text(
         uiText(c,
-            'Your questions and the rows the coach reads are sent to OpenAI under your ChatGPT account. See exactly what that is on "What was sent".'),
+            'Your questions and the rows the coach reads are sent to OpenAI under your ChatGPT account, where your ChatGPT data controls, including model training, may apply. Check them in ChatGPT settings. See exactly what is sent on "What was sent".'),
         style: F.cap.copyWith(color: p.ink3, height: 1.5),
       ),
     ];

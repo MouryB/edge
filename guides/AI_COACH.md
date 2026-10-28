@@ -16,9 +16,9 @@ model you host yourself.
 
 ## Use your ChatGPT plan
 
-If you pay for ChatGPT (Plus, Pro and similar plans), you can skip the API
-key: open **AI Coach → settings**, tap **ChatGPT**, then **Continue with
-ChatGPT** and sign in. Eligible coach, briefing and journal requests then use
+If you pay for ChatGPT Plus or Pro, you can skip the API key: open
+**AI Coach → settings**, tap **ChatGPT**, then **Continue with ChatGPT** and
+sign in. Eligible coach, briefing and journal requests then use
 the usage included in your ChatGPT plan instead of API billing. Tap **List
 models** and pick one, then **Save**.
 
@@ -32,7 +32,9 @@ models** and pick one, then **Save**.
 - When the limit is reached the coach says so and stops; it never quietly
   switches to an API key.
 - Your questions and the rows the coach reads go to OpenAI under your ChatGPT
-  account, exactly as with an OpenAI API key.
+  account. Your ChatGPT data controls, including whether your content may be
+  used to train models, may apply to these requests, and they are not the same
+  terms as an OpenAI API key. Check them in ChatGPT settings before using this.
 - **Sign out of ChatGPT** asks OpenAI to revoke the sign-in and clears it from
   the phone. If the app says revocation wasn't confirmed, also disconnect
   OpenStrap in ChatGPT settings. The coach then stays off until you sign in
