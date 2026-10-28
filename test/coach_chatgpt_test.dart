@@ -633,7 +633,7 @@ void main() {
       await refreshed;
       expect(auth.signedIn, isFalse);
       expect(keychain, isEmpty);
-      expect(revoked, ['rt-2'], reason: 'the rotated token is the live one');
+      expect(revoked, ['rt-2', 'at-2'], reason: 'the rotated tokens are the live ones');
     });
 
     test('a reset during a refresh does not make a later sign-out revoke the stale token', () async {
@@ -667,8 +667,57 @@ void main() {
           scope: _fullScope,
           expiresAt: DateTime.now().add(const Duration(hours: 1))));
       await auth.signOut();
-      // The reset revoked the rotated token; the sign-out revoked only its own.
-      expect(revoked, ['rt-2', 'rt-new']);
+      // The reset revoked the rotated tokens; the sign-out revoked only its own.
+      expect(revoked, ['rt-2', 'at-2', 'rt-new']);
+    });
+
+    test('a refresh that lands after a new sign-in is revoked, not left for its sign-out', () async {
+      SharedPreferences.setMockInitialValues({'coach_chatgpt_client_id': 'oaiapp_1'});
+      final oldGate = Completer<void>();
+      final revoked = <String>[];
+      final refreshed = <String>[];
+      final auth = ChatGptAuth(client: MockClient((req) async {
+        if (req.url.path.endsWith('/revoke')) {
+          revoked.add(req.bodyFields['token']!);
+          return http.Response('', 200);
+        }
+        final rt = req.bodyFields['refresh_token']!;
+        refreshed.add(rt);
+        if (rt == 'rt-1') await oldGate.future; // the old session's refresh hangs
+        return http.Response(
+            jsonEncode({
+              'access_token': rt == 'rt-1' ? 'at-2' : 'at-new-2',
+              'refresh_token': rt == 'rt-1' ? 'rt-2' : 'rt-new-2',
+              'expires_in': 3600,
+            }),
+            200);
+      }));
+      await auth.debugSetSession(_session(expiresAt: DateTime.now()));
+      final stale = expectLater(auth.accessToken(), throwsA(isA<ChatGptException>()));
+      await pumpEventQueue();
+      // Signed out with the refresh still out (revocation unconfirmed until it
+      // lands), then signed straight back in.
+      final out = auth.signOut();
+      await pumpEventQueue();
+      await auth.debugSetSession(ChatGptSession(
+          sub: 'user-1',
+          email: 'me@example.com',
+          idToken: 'i',
+          accessToken: 'at-new',
+          refreshToken: 'rt-new',
+          scope: _fullScope,
+          expiresAt: DateTime.now()));
+      // The new session refreshes on its own token, not through the old call.
+      expect(await auth.accessToken(), 'at-new-2');
+      oldGate.complete();
+      await stale;
+      expect(await out, isTrue);
+      expect(revoked, ['rt-2', 'at-2'], reason: 'the old rotation is revoked as it lands');
+      expect(auth.session!.refreshToken, 'rt-new-2');
+      revoked.clear();
+      await auth.signOut();
+      expect(revoked, ['rt-new-2'], reason: "the sign-out revokes the current session's token");
+      expect(refreshed, ['rt-1', 'rt-new']);
     });
 
     test('a sign-in during a slow sign-out survives it', () async {

@@ -295,6 +295,11 @@ class ChatGptAuth extends ChangeNotifier {
   HttpServer? _pending;
   Future<String>? _refreshing;
 
+  /// The [_generation] [_refreshing] was started under. A session that came
+  /// after it never shares it: that refresh is spending another session's
+  /// token.
+  int _refreshingGeneration = -1;
+
   /// Bumped by every [signIn] and every [cancelSignIn]. A code exchange that
   /// finishes under an older value was cancelled (or replaced) while it was
   /// out, so its tokens are revoked rather than stored.
@@ -319,10 +324,6 @@ class ChatGptAuth extends ChangeNotifier {
     _lock = done.catchError((_) {});
     return done;
   }
-
-  /// The refresh token a refresh rotated to after [signOut] began. It is not
-  /// stored, but it is the live one, so it is the one to revoke.
-  String? _rotatedAfterSignOut;
 
   ChatGptSession? get session => _session;
   bool get signedIn => _session != null;
@@ -410,11 +411,7 @@ class ChatGptAuth extends ChangeNotifier {
         await prefs.setBool(_kPresent, s != null);
         // A sign-out that began mid-write clears the keychain right after us.
         current();
-        if (commit) {
-          _generation++;
-          // A new session: an earlier one's rotated token is not this one's.
-          _rotatedAfterSignOut = null;
-        }
+        if (commit) _generation++;
         _session = s;
         _unreadable = false;
         notifyListeners();
@@ -589,7 +586,14 @@ class ChatGptAuth extends ChangeNotifier {
     if (s.expiresAt.isAfter(clock.now().add(const Duration(minutes: 5)))) {
       return Future.value(s.accessToken);
     }
-    return _refreshing ??= _refresh(s).whenComplete(() => _refreshing = null);
+    final pending = _refreshing;
+    if (pending != null && _refreshingGeneration == _generation) return pending;
+    _refreshingGeneration = _generation;
+    late final Future<String> f;
+    f = _refresh(s).whenComplete(() {
+      if (identical(_refreshing, f)) _refreshing = null;
+    });
+    return _refreshing = f;
   }
 
   Future<String> _refresh(ChatGptSession s) async {
@@ -621,18 +625,19 @@ class ChatGptAuth extends ChangeNotifier {
       idToken: (t['id_token'] as String?) ?? s.idToken,
     );
     if (generation != _generation) {
-      // Signed out while the call was out: do not bring the session back, but
-      // the rotated token is the live one and [signOut] has to revoke it.
-      _rotatedAfterSignOut = next.refreshToken;
-      throw ChatGptException('Signed out.');
+      // Signed out (or replaced) while the call was out: the rotated tokens
+      // belong to a session that has ended, so they are revoked here rather
+      // than handed on — a later sign-out is about a later session.
+      throw _StaleRefresh(await _revokeIssued(
+          refreshToken: next.refreshToken, accessToken: next.accessToken, clientId: clientId));
     }
     try {
       await _store(next, generation: generation);
     } catch (_) {
       if (generation != _generation) {
-        // Signed out while it was writing: the rotated token is the live one.
-        _rotatedAfterSignOut = next.refreshToken;
-        rethrow;
+        // Signed out while it was writing: same as above.
+        throw _StaleRefresh(await _revokeIssued(
+            refreshToken: next.refreshToken, accessToken: next.accessToken, clientId: clientId));
       }
       // The keychain write failed, but the old refresh token is already spent:
       // keep the rotated session in memory so the next refresh does not reuse it.
@@ -648,19 +653,19 @@ class ChatGptAuth extends ChangeNotifier {
     final generation = ++_generation; // before any await: see [_generation]
     cancelSignIn();
     final s = _session;
+    final refreshing = _refreshing;
     // Memory first, so nothing keeps using the session while revocation is out.
     _session = null;
     _unreadable = false;
     notifyListeners();
-    // An in-flight refresh may have rotated the token; revoke the latest one.
-    try {
-      await _refreshing;
-    } catch (_) {}
-    final token = _rotatedAfterSignOut ?? s?.refreshToken;
-    _rotatedAfterSignOut = null;
+    // An in-flight refresh revokes what it rotated to itself; the token it
+    // spent is then dead and there is nothing left to revoke here.
+    final rotated = await _rotationOf(refreshing);
     final prefs = await SharedPreferences.getInstance();
     final clientId = prefs.getString(_kClientId);
-    final revoked = token == null || (clientId != null && await _revoke(token, clientId));
+    final token = s?.refreshToken;
+    final revoked = rotated ??
+        (token == null || (clientId != null && await _revoke(token, clientId)));
     // Signed out either way. If the delete fails the item may linger, but the
     // marker is cleared and [load] fails closed on a record without it, so it
     // is never restored (it is deleted then); the credential is not guaranteed
@@ -675,6 +680,19 @@ class ChatGptAuth extends ChangeNotifier {
       await prefs.setBool(_kPresent, false);
     });
     return revoked;
+  }
+
+  /// Waits out a refresh that was in flight when the session ended. Non-null
+  /// when it had rotated the tokens (and so revoked them itself): whether that
+  /// revocation was confirmed.
+  static Future<bool?> _rotationOf(Future<String>? refreshing) async {
+    if (refreshing == null) return null;
+    try {
+      await refreshing;
+    } on _StaleRefresh catch (e) {
+      return e.revoked;
+    } catch (_) {}
+    return null;
   }
 
   /// True when OpenAI confirmed [token] is revoked.
@@ -714,18 +732,14 @@ class ChatGptAuth extends ChangeNotifier {
     _generation++;
     cancelSignIn();
     final s = _session;
+    final refreshing = _refreshing;
     _session = null;
     _unreadable = false;
-    // An in-flight refresh may have rotated the token; revoke the latest one.
-    // It is cleared here too: left behind, it would be revoked in place of a
-    // later session's token.
-    try {
-      await _refreshing;
-    } catch (_) {}
-    final token = _rotatedAfterSignOut ?? s?.refreshToken;
-    _rotatedAfterSignOut = null;
+    // As in [signOut]: an in-flight refresh revokes its own rotated tokens.
+    final rotated = await _rotationOf(refreshing);
+    final token = s?.refreshToken;
     final clientId = (await SharedPreferences.getInstance()).getString(_kClientId);
-    if (token != null && clientId != null) await _revoke(token, clientId);
+    if (rotated == null && token != null && clientId != null) await _revoke(token, clientId);
     await _serialized(() async {
       try {
         await _secure.delete(key: _kSession, iOptions: _apple, mOptions: _macos);
@@ -769,6 +783,13 @@ class ChatGptAuth extends ChangeNotifier {
   @visibleForTesting
   Future<void> debugSetSession(ChatGptSession? s) =>
       _store(s, generation: _generation, commit: true);
+}
+
+/// A refresh that came back after its session ended. Its rotated tokens were
+/// revoked on the spot; [revoked] says whether OpenAI confirmed it.
+class _StaleRefresh extends ChatGptException {
+  final bool revoked;
+  _StaleRefresh(this.revoked) : super('Signed out.');
 }
 
 class _TokenError implements Exception {
