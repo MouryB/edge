@@ -550,6 +550,16 @@ void main() {
       await cfg.chatgpt.debugSetSession(_session(scope: 'openid email profile offline_access'));
       expect(cfg.configured, isFalse);
     });
+
+    test('a leftover API key does not schedule reminders for a signed-out ChatGPT coach', () async {
+      await cfg.save(apiKey: 'sk-left-over');
+      expect(cfg.remindersConfigured, isTrue);
+      await cfg.chatgpt.signOut();
+      expect(cfg.hasKey, isTrue);
+      expect(cfg.remindersConfigured, isFalse);
+      await cfg.save(useChatGpt: false);
+      expect(cfg.remindersConfigured, isTrue, reason: 'the key route still counts its key');
+    });
   });
 
   group('session lifecycle', () {

@@ -289,6 +289,11 @@ class CoachConfig extends ChangeNotifier {
       ? chatgpt.sharing && _model.isNotEmpty
       : (hasKey || isLocalEndpoint) && _baseUrl.isNotEmpty && _model.isNotEmpty;
 
+  /// Whether AI reminders (briefings) may be scheduled. On the ChatGPT route
+  /// only the ChatGPT sign-in counts: a BYOK key left over from before the
+  /// switch is not used there, so a signed-out ChatGPT coach is not set up.
+  bool get remindersConfigured => _useChatGpt ? configured : hasKey;
+
   /// Normalised base, no trailing slash.
   String get apiBase {
     if (_useChatGpt) return kChatGptApiBase;
