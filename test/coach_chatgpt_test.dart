@@ -244,33 +244,79 @@ void main() {
       expect(second.queryParameters['id_token_hint'], isNotNull);
     });
 
-    test('sign-out while the code exchange is pending leaves nothing stored', () async {
-      final gate = Completer<void>(), arrived = Completer<void>();
-      late Uri first;
-      auth = ChatGptAuth(client: MockClient((req) async {
-        arrived.complete();
-        await gate.future;
-        return http.Response(
-            jsonEncode({
-              'access_token': 'at-1',
-              'refresh_token': 'rt-1',
-              'id_token': _idToken(req.bodyFields['client_id']!, first.queryParameters['nonce']!),
-              'scope': _fullScope,
+    /// A token endpoint that holds the code exchange until [gate] opens, and
+    /// records every revocation.
+    ChatGptAuth pendingExchange(Completer<void> gate, Completer<void> arrived,
+            List<(String, String, String)> revoked, Uri Function() authorize,
+            {bool signed = true}) =>
+        ChatGptAuth(client: MockClient((req) async {
+          final oidc = _oidc(req);
+          if (oidc != null) return oidc;
+          if (req.url.path.endsWith('/revoke')) {
+            revoked.add((req.bodyFields['token']!, req.bodyFields['token_type_hint']!,
+                req.bodyFields['client_id']!));
+            return http.Response('', 200);
+          }
+          arrived.complete();
+          await gate.future;
+          var id = _idToken(req.bodyFields['client_id']!, authorize().queryParameters['nonce']!);
+          if (!signed) id = '${id.substring(0, id.lastIndexOf('.'))}.AAAA';
+          return http.Response(
+              jsonEncode({
+                'access_token': 'at-1',
+                'refresh_token': 'rt-1',
+                'id_token': id,
+                'scope': _fullScope,
+              }),
+              200);
+        }));
+
+    const issued = [
+      ('rt-1', 'refresh_token', 'oaiapp_1'),
+      ('at-1', 'access_token', 'oaiapp_1'),
+    ];
+
+    for (final (what, end) in <(String, Future<void> Function(ChatGptAuth))>[
+      ('sign-out', (a) => a.signOut()),
+      ('cancel', (a) async => a.cancelSignIn()),
+      ('reset', (a) => a.forgetAll()),
+    ]) {
+      test('a code exchange that lands after a $what revokes what it was issued', () async {
+        final gate = Completer<void>(), arrived = Completer<void>();
+        final revoked = <(String, String, String)>[];
+        late Uri first;
+        auth = pendingExchange(gate, arrived, revoked, () => first);
+        final signIn = expectLater(
+            auth.signIn((u) {
+              first = u;
+              return browser(u, clientId: 'oaiapp_1');
             }),
-            200);
-      }));
-      final signIn = expectLater(
+            throwsA(isA<ChatGptException>()));
+        await arrived.future;
+        await end(auth);
+        gate.complete();
+        await signIn;
+        expect(auth.signedIn, isFalse);
+        expect(keychain, isEmpty);
+        // The reset deleted the saved client id; the revocation still has it.
+        expect(revoked, issued);
+      });
+    }
+
+    test('an ID token that fails its signature check is revoked, not stored', () async {
+      final gate = Completer<void>()..complete(), arrived = Completer<void>();
+      final revoked = <(String, String, String)>[];
+      late Uri first;
+      auth = pendingExchange(gate, arrived, revoked, () => first, signed: false);
+      await expectLater(
           auth.signIn((u) {
             first = u;
             return browser(u, clientId: 'oaiapp_1');
           }),
-          throwsA(isA<ChatGptException>()));
-      await arrived.future;
-      await auth.signOut();
-      gate.complete();
-      await signIn;
+          throwsA(isA<ChatGptException>().having((e) => e.message, 'message', contains('check out'))));
       expect(auth.signedIn, isFalse);
       expect(keychain, isEmpty);
+      expect(revoked, issued);
     });
 
     test('a sign-in already writing when sign-out starts is cleared afterwards', () async {

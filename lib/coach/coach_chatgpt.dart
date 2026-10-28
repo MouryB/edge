@@ -295,6 +295,11 @@ class ChatGptAuth extends ChangeNotifier {
   HttpServer? _pending;
   Future<String>? _refreshing;
 
+  /// Bumped by every [signIn] and every [cancelSignIn]. A code exchange that
+  /// finishes under an older value was cancelled (or replaced) while it was
+  /// out, so its tokens are revoked rather than stored.
+  int _attempt = 0;
+
   /// Bumped whenever a sign-in commits a session, and at the very start of
   /// [signOut]/[forgetAll]. A [load], [_refresh] or [signIn] that started under
   /// an older value must not apply its result — a slow keychain read or token call
@@ -376,9 +381,17 @@ class ChatGptAuth extends ChangeNotifier {
   /// lock before any write: if the session was signed out or replaced since,
   /// the result is dropped. A sign-in or [debugSetSession] passes `commit` to
   /// start a new generation once its write lands.
-  Future<void> _store(ChatGptSession? s, {required int generation, bool commit = false}) =>
+  Future<void> _store(ChatGptSession? s,
+          {required int generation, bool commit = false, int? attempt}) =>
       _serialized(() async {
-        if (generation != _generation) throw ChatGptException('Signed out.');
+        void current() {
+          if (generation != _generation) throw ChatGptException('Signed out.');
+          if (attempt != null && attempt != _attempt) {
+            throw ChatGptException('Sign-in was cancelled.');
+          }
+        }
+
+        current();
         final prefs = await SharedPreferences.getInstance();
         if (s == null) {
           await _secure.delete(key: _kSession, iOptions: _apple, mOptions: _macos);
@@ -396,7 +409,7 @@ class ChatGptAuth extends ChangeNotifier {
         }
         await prefs.setBool(_kPresent, s != null);
         // A sign-out that began mid-write clears the keychain right after us.
-        if (generation != _generation) throw ChatGptException('Signed out.');
+        current();
         if (commit) {
           _generation++;
           // A new session: an earlier one's rotated token is not this one's.
@@ -417,6 +430,7 @@ class ChatGptAuth extends ChangeNotifier {
   /// lands on a listener on this device's loopback.
   Future<void> signIn(Future<bool> Function(Uri) open) async {
     final generation = _generation;
+    final attempt = ++_attempt;
     final prefs = await SharedPreferences.getInstance();
     final hostId = prefs.getString(_kHostId) ?? 'urn:uuid:${const Uuid().v4()}';
     await prefs.setString(_kHostId, hostId);
@@ -471,20 +485,37 @@ class ChatGptAuth extends ChangeNotifier {
         throw ChatGptException(
             'ChatGPT sign-in failed (${e.code ?? e.status}). Try again.');
       }
-      final idToken = t['id_token'] as String?;
-      if (idToken == null) throw ChatGptException('ChatGPT returned no identity.');
+      // From here on tokens exist on OpenAI's side. Any way this attempt ends
+      // other than a stored session — a sign-out, reset or cancel that landed
+      // while the exchange was out, or a token that does not check out —
+      // revokes them, with the client id captured above (a reset deletes the
+      // saved one).
       try {
-        await _jwks.verify(idToken);
-      } on ChatGptSignatureException catch (e) {
-        debugPrint('[chatgpt] $e');
-        throw ChatGptException('ChatGPT returned a sign-in that did not check out.');
+        if (generation != _generation) throw ChatGptException('Signed out.');
+        if (attempt != _attempt) throw ChatGptException('Sign-in was cancelled.');
+        final idToken = t['id_token'] as String?;
+        if (idToken == null) throw ChatGptException('ChatGPT returned no identity.');
+        try {
+          await _jwks.verify(idToken);
+        } on ChatGptSignatureException catch (e) {
+          debugPrint('[chatgpt] $e');
+          throw ChatGptException('ChatGPT returned a sign-in that did not check out.');
+        }
+        final who = chatGptIdentity(idToken, clientId: clientId, nonce: nonce);
+        await _store(
+          _sessionFrom(t, sub: who.sub, email: who.email, idToken: idToken),
+          generation: generation,
+          commit: true,
+          attempt: attempt,
+        );
+      } catch (_) {
+        await _revokeIssued(
+          refreshToken: t['refresh_token'] is String ? t['refresh_token'] as String : null,
+          accessToken: t['access_token'] as String, // [_token] checked it
+          clientId: clientId,
+        );
+        rethrow;
       }
-      final who = chatGptIdentity(idToken, clientId: clientId, nonce: nonce);
-      await _store(
-        _sessionFrom(t, sub: who.sub, email: who.email, idToken: idToken),
-        generation: generation,
-        commit: true,
-      );
     } finally {
       if (identical(_pending, server)) _pending = null;
       await server.close(force: true);
@@ -493,7 +524,10 @@ class ChatGptAuth extends ChangeNotifier {
 
   /// Ends a [signIn] still waiting on the browser. Nothing tells the app when
   /// the user simply closes the in-app browser, so this is the way out.
-  void cancelSignIn() => _pending?.close(force: true);
+  void cancelSignIn() {
+    _attempt++;
+    _pending?.close(force: true);
+  }
 
   /// The first callback carrying our [state]. Anything else that reaches the
   /// loopback port is turned away without ending the sign-in.
@@ -643,18 +677,34 @@ class ChatGptAuth extends ChangeNotifier {
     return revoked;
   }
 
-  /// True when OpenAI confirmed the refresh token is revoked.
-  Future<bool> _revoke(String token, String clientId) async {
+  /// True when OpenAI confirmed [token] is revoked.
+  Future<bool> _revoke(String token, String clientId,
+      {String hint = 'refresh_token'}) async {
     try {
       final r = await _http((c) => c.post(Uri.parse(_revokeUrl), body: {
             'token': token,
-            'token_type_hint': 'refresh_token',
+            'token_type_hint': hint,
             'client_id': clientId,
           }).timeout(const Duration(seconds: 15)));
       return r.statusCode == 200;
     } catch (_) {
       return false;
     }
+  }
+
+  /// Revokes tokens this app holds but will not keep: the refresh token, which
+  /// is what keeps the grant alive, then the access token so it does not stay
+  /// usable for the rest of its hour. True only when both were confirmed.
+  Future<bool> _revokeIssued(
+      {required String? refreshToken,
+      required String? accessToken,
+      required String clientId}) async {
+    var ok = true;
+    if (refreshToken != null) ok = await _revoke(refreshToken, clientId) && ok;
+    if (accessToken != null) {
+      ok = await _revoke(accessToken, clientId, hint: 'access_token') && ok;
+    }
+    return ok;
   }
 
   /// "Reset all data": the session plus the registration and welcome flag.
