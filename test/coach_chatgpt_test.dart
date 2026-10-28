@@ -592,6 +592,86 @@ void main() {
       }
     });
 
+    test('function tools go in a namespace on this route, and history calls carry it', () async {
+      final tool = {
+        'type': 'function',
+        'function': {
+          'name': 'run_sql',
+          'description': 'query',
+          'parameters': {'type': 'object', 'properties': {}},
+        },
+      };
+      late Map sent;
+      final reply = await CoachEngine.postChat(cfg, {
+        'model': 'gpt-6.1-sol',
+        'messages': [
+          {'role': 'user', 'content': 'hi'},
+          {
+            'role': 'assistant',
+            'content': '',
+            'tool_calls': [
+              {
+                'id': 'c0',
+                'type': 'function',
+                'function': {'name': 'run_sql', 'arguments': '{}'},
+              },
+            ],
+          },
+          {'role': 'tool', 'tool_call_id': 'c0', 'content': '[]'},
+        ],
+        'tools': [tool],
+        'tool_choice': 'auto',
+      }, client: MockClient((req) async {
+        sent = jsonDecode(req.body) as Map;
+        return http.Response(
+            _sse([
+              {
+                'type': 'response.completed',
+                'response': {
+                  'status': 'completed',
+                  'output': [
+                    {
+                      'type': 'function_call',
+                      'name': 'run_sql',
+                      'namespace': kChatGptToolNamespace,
+                      'call_id': 'c1',
+                      'arguments': '{"sql":"SELECT 1"}',
+                      'status': 'completed',
+                    },
+                  ],
+                },
+              },
+            ]),
+            200);
+      }));
+      final tools = sent['tools'] as List;
+      expect(tools, hasLength(1));
+      expect(tools.single['type'], 'namespace');
+      expect(tools.single['name'], kChatGptToolNamespace);
+      expect((tools.single['tools'] as List).single,
+          allOf(containsPair('type', 'function'), containsPair('name', 'run_sql')));
+      expect(sent['tool_choice'], 'auto');
+      final call = (sent['input'] as List).firstWhere((i) => i['type'] == 'function_call');
+      expect(call['namespace'], kChatGptToolNamespace);
+      expect(call['name'], 'run_sql');
+      final out = (reply['tool_calls'] as List).single;
+      expect(out['function'], {'name': 'run_sql', 'arguments': '{"sql":"SELECT 1"}'});
+
+      // The API-key route still sends bare top-level function tools.
+      await cfg.save(useChatGpt: false, apiKey: 'sk-test');
+      await CoachEngine.postChat(cfg, {
+        'model': 'gpt-6.1-sol',
+        'messages': [
+          {'role': 'user', 'content': 'hi'},
+        ],
+        'tools': [tool],
+      }, client: MockClient((req) async {
+        sent = jsonDecode(req.body) as Map;
+        return http.Response(jsonEncode(_completed('ok')['response']), 200);
+      }));
+      expect((sent['tools'] as List).single['type'], 'function');
+    });
+
     test('signed in without plan usage is not configured', () async {
       await cfg.chatgpt.debugSetSession(_session(scope: 'openid email profile offline_access'));
       expect(cfg.configured, isFalse);

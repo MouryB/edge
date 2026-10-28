@@ -212,21 +212,63 @@ String chatGptHttpError(int status, String body) {
       status, null, body.length > 200 ? body.substring(0, 200) : body);
 }
 
+/// The namespace the coach's function tools are grouped under on the
+/// ChatGPT-plan route.
+const kChatGptToolNamespace = 'openstrap';
+
 /// The Responses body this route accepts, from the coach's normal one: it
 /// must stream, and rejects `system` input items (developer is the same thing
 /// here). Sampling params are already never sent on Responses.
-Map<String, dynamic> chatGptRequest(Map<String, dynamic> body) => {
-      ...body,
-      'stream': true,
-      'store': false,
-      'input': [
-        for (final item in body['input'] as List)
-          if (item is Map && item['role'] == 'system')
-            {...item, 'role': 'developer'}
-          else
-            item,
+///
+/// Function tools are only accepted here grouped in a namespace (or through
+/// `additional_tools` input items), not as bare top-level tools, so they go
+/// under [kChatGptToolNamespace]. The model's calls then carry that
+/// namespace beside the bare function name, and a `function_call` replayed
+/// from history without one gets it too, so it matches a declared tool.
+/// https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations
+Map<String, dynamic> chatGptRequest(Map<String, dynamic> body) {
+  final tools = body['tools'];
+  final functions = <Map<String, dynamic>>[];
+  final others = <Object?>[];
+  if (tools is List) {
+    for (final t in tools) {
+      if (t is Map && t['type'] == 'function') {
+        functions.add(t.cast<String, dynamic>());
+      } else {
+        others.add(t);
+      }
+    }
+  }
+  final names = {for (final f in functions) f['name']};
+  return {
+    ...body,
+    'stream': true,
+    'store': false,
+    'input': [
+      for (final item in body['input'] as List)
+        if (item is Map && item['role'] == 'system')
+          {...item, 'role': 'developer'}
+        else if (item is Map &&
+            item['type'] == 'function_call' &&
+            item['namespace'] == null &&
+            names.contains(item['name']))
+          {...item, 'namespace': kChatGptToolNamespace}
+        else
+          item,
+    ],
+    if (tools is List)
+      'tools': [
+        if (functions.isNotEmpty)
+          {
+            'type': 'namespace',
+            'name': kChatGptToolNamespace,
+            'description': 'Read and present this person\'s OpenStrap health data.',
+            'tools': functions,
+          },
+        ...others,
       ],
-    };
+  };
+}
 
 class ChatGptSession {
   final String sub, email, idToken, accessToken, refreshToken, scope;
