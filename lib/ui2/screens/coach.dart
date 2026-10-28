@@ -1174,16 +1174,15 @@ class _CoachSetupState extends State<CoachSetup> {
         onTap: _signingIn
             ? null
             : () {
-                if (chatgpt.sharing) {
-                  setState(() {
-                    _msg = null;
-                    _chatgpt = true;
-                    _models = const [];
-                    _model = '';
-                  });
-                } else {
-                  _signInChatGpt();
-                }
+                // Selected before a sign-in starts too, so its fields (and the
+                // "Cancel sign-in" button) show while the browser is up.
+                setState(() {
+                  _msg = null;
+                  _chatgpt = true;
+                  _models = const [];
+                  _model = '';
+                });
+                if (!chatgpt.sharing) _signInChatGpt();
               },
         child: Row(
           children: [

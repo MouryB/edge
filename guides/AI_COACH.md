@@ -17,8 +17,7 @@ model you host yourself.
 ## Use your ChatGPT plan
 
 If you pay for ChatGPT Plus or Pro, you can skip the API key: open
-**AI Coach → settings**, tap **ChatGPT**, then **Continue with ChatGPT** and
-sign in. Eligible coach, briefing and journal requests then use
+**AI Coach → settings**, tap **ChatGPT** and sign in. Eligible coach, briefing and journal requests then use
 the usage included in your ChatGPT plan instead of API billing. Tap **List
 models** and pick one, then **Save**.
 
