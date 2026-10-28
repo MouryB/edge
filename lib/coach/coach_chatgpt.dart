@@ -19,6 +19,8 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
+import 'coach_chatgpt_jwks.dart';
+
 const kChatGptIssuer = 'https://auth.openai.com';
 
 /// Both the OAuth `resource` and the Responses API base requests go to.
@@ -86,11 +88,9 @@ Uri chatGptAuthorizeUri({
 String chatGptCodeChallenge(String verifier) =>
     base64Url.encode(sha256.convert(ascii.encode(verifier)).bytes).replaceAll('=', '');
 
-/// The ID token's `sub` and `email` once its claims check out.
-///
-/// The signature is not verified: the token comes straight from the token
-/// endpoint over TLS in a PKCE code exchange, where OIDC Core §3.1.3.7(6)
-/// allows TLS server validation in its place. iss/aud/exp/nonce still are.
+/// The ID token's `sub` and `email` once its claims check out. Only the
+/// claims are checked here (iss/aud/exp/nonce); the caller verifies the
+/// signature first with [ChatGptJwks.verify].
 ({String sub, String email}) chatGptIdentity(
   String idToken, {
   required String clientId,
@@ -284,6 +284,12 @@ class ChatGptAuth extends ChangeNotifier {
   final FlutterSecureStorage _secure = const FlutterSecureStorage();
   final http.Client? _client;
 
+  /// OpenAI's signing keys, cached for the life of this object.
+  late final ChatGptJwks _jwks = ChatGptJwks(
+    issuer: kChatGptIssuer,
+    get: (u) => _http((c) => c.get(u).timeout(const Duration(seconds: 20))),
+  );
+
   ChatGptSession? _session;
   bool _unreadable = false;
   HttpServer? _pending;
@@ -467,6 +473,12 @@ class ChatGptAuth extends ChangeNotifier {
       }
       final idToken = t['id_token'] as String?;
       if (idToken == null) throw ChatGptException('ChatGPT returned no identity.');
+      try {
+        await _jwks.verify(idToken);
+      } on ChatGptSignatureException catch (e) {
+        debugPrint('[chatgpt] $e');
+        throw ChatGptException('ChatGPT returned a sign-in that did not check out.');
+      }
       final who = chatGptIdentity(idToken, clientId: clientId, nonce: nonce);
       await _store(
         _sessionFrom(t, sub: who.sub, email: who.email, idToken: idToken),

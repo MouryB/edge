@@ -5,22 +5,82 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:clock/clock.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
 import 'package:http/testing.dart';
 import 'package:openstrap_edge/coach/coach_chatgpt.dart';
+import 'package:openstrap_edge/coach/coach_chatgpt_jwks.dart';
 import 'package:openstrap_edge/coach/coach_config.dart';
 import 'package:openstrap_edge/coach/coach_engine.dart';
+import 'package:pointycastle/export.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 // Flutter's test binding fakes HttpClient; this one really reaches loopback.
 class _RealHttpOverrides extends HttpOverrides {}
 
-String _jwt(Map<String, Object?> claims) {
-  String b64(Object o) => base64Url.encode(utf8.encode(jsonEncode(o))).replaceAll('=', '');
-  return '${b64({'alg': 'RS256'})}.${b64(claims)}.sig';
+// A real RS256 key pair, so the ID token goes through the same signature
+// check as OpenAI's. Generated once: 2048-bit generation is the slow part.
+final AsymmetricKeyPair<RSAPublicKey, RSAPrivateKey> _rsa = () {
+  final rnd = FortunaRandom()
+    ..seed(KeyParameter(Uint8List.fromList(List.generate(32, (i) => i * 7 + 1))));
+  final gen = RSAKeyGenerator()
+    ..init(ParametersWithRandom(RSAKeyGeneratorParameters(BigInt.from(65537), 2048, 64), rnd));
+  final pair = gen.generateKeyPair();
+  return AsymmetricKeyPair(pair.publicKey as RSAPublicKey, pair.privateKey as RSAPrivateKey);
+}();
+
+const _kid = 'test-kid';
+
+String _b64(Object o) => base64Url.encode(utf8.encode(jsonEncode(o))).replaceAll('=', '');
+
+String _b64Int(BigInt v) {
+  final bytes = <int>[];
+  while (v > BigInt.zero) {
+    bytes.insert(0, (v & BigInt.from(0xff)).toInt());
+    v = v >> 8;
+  }
+  return base64Url.encode(bytes).replaceAll('=', '');
+}
+
+String _sign(String header, String claims, [RSAPrivateKey? key]) {
+  final signer = RSASigner(SHA256Digest(), '0609608648016503040201')
+    ..init(true, PrivateKeyParameter<RSAPrivateKey>(key ?? _rsa.privateKey));
+  final sig = signer.generateSignature(Uint8List.fromList(ascii.encode('$header.$claims')));
+  return base64Url.encode(sig.bytes).replaceAll('=', '');
+}
+
+String _jwt(Map<String, Object?> claims, {Map<String, Object?>? header}) {
+  final h = _b64(header ?? {'alg': 'RS256', 'kid': _kid, 'typ': 'JWT'});
+  final c = _b64(claims);
+  return '$h.$c.${_sign(h, c)}';
+}
+
+String _jwksBody([String kid = _kid]) => jsonEncode({
+      'keys': [
+        {
+          'kty': 'RSA',
+          'kid': kid,
+          'alg': 'RS256',
+          'use': 'sig',
+          'n': _b64Int(_rsa.publicKey.modulus!),
+          'e': _b64Int(_rsa.publicKey.exponent!),
+        },
+      ],
+    });
+
+/// Serves OpenAI's discovery document and key set; null for anything else.
+http.Response? _oidc(http.BaseRequest req, {String kid = _kid}) {
+  final u = req.url.toString();
+  if (u == '$kChatGptIssuer/.well-known/openid-configuration') {
+    return http.Response(
+        jsonEncode({'issuer': kChatGptIssuer, 'jwks_uri': '$kChatGptIssuer/.well-known/jwks.json'}),
+        200);
+  }
+  if (u == '$kChatGptIssuer/.well-known/jwks.json') return http.Response(_jwksBody(kid), 200);
+  return null;
 }
 
 String _idToken(String clientId, String nonce, {String iss = kChatGptIssuer, int? exp}) =>
@@ -131,6 +191,8 @@ void main() {
 
     ChatGptAuth makeAuth(String Function() nonce) => ChatGptAuth(
           client: MockClient((req) async {
+            final oidc = _oidc(req);
+            if (oidc != null) return oidc;
             expect(req.url.toString(), '$kChatGptIssuer/api/accounts/oauth/token');
             tokenForms.add(req.bodyFields);
             if (req.bodyFields['grant_type'] == 'authorization_code') {
@@ -261,6 +323,92 @@ void main() {
       expect(() => chatGptIdentity(token, clientId: client, nonce: nonce),
           throwsA(isA<ChatGptException>()));
     }
+  });
+
+  group('ID token signature', () {
+    late int fetches;
+    late String servedKid;
+    late bool down;
+    late ChatGptJwks jwks;
+    setUp(() {
+      fetches = 0;
+      servedKid = _kid;
+      down = false;
+      jwks = ChatGptJwks(
+        issuer: kChatGptIssuer,
+        get: (u) async {
+          if (down) throw const SocketException('offline');
+          if (u.path.endsWith('jwks.json')) fetches++;
+          return _oidc(http.Request('GET', u), kid: servedKid)!;
+        },
+      );
+    });
+
+    String claims() => _b64({'iss': kChatGptIssuer, 'sub': 'user-1'});
+
+    test('a token signed by a published key verifies, and the keys are cached', () async {
+      await jwks.verify(_idToken('oaiapp_1', 'n1'));
+      await jwks.verify(_idToken('oaiapp_1', 'n2'));
+      expect(fetches, 1);
+    });
+
+    test('a forged, re-signed or unsigned token is rejected', () async {
+      final good = _idToken('oaiapp_1', 'n1').split('.');
+      final h = _b64({'alg': 'RS256', 'kid': _kid});
+      for (final token in [
+        '${good[0]}.${claims()}.${good[2]}', // claims swapped under the old signature
+        '${good[0]}.${good[1]}.${good[2].substring(0, good[2].length - 4)}AAAA',
+        '${_b64({'alg': 'none', 'kid': _kid})}.${good[1]}.',
+        '${_b64({'alg': 'HS256', 'kid': _kid})}.${good[1]}.${good[2]}',
+        '${_b64({'alg': 'RS256'})}.${good[1]}.${good[2]}', // no kid
+        '${_b64({'alg': 'RS256', 'kid': _kid, 'jwk': {'kty': 'RSA'}})}.${good[1]}.${good[2]}',
+        '$h.${good[1]}',
+        'garbage',
+      ]) {
+        await expectLater(jwks.verify(token), throwsA(isA<ChatGptSignatureException>()),
+            reason: token);
+      }
+    });
+
+    test('an unknown kid refetches once, then is rejected', () async {
+      var now = DateTime(2026, 10, 1);
+      await withClock(Clock(() => now), () async {
+        await jwks.verify(_idToken('oaiapp_1', 'n1'));
+        expect(fetches, 1);
+        // A kid that is nowhere: rejected, and not a refetch per token.
+        for (var i = 0; i < 3; i++) {
+          await expectLater(
+              jwks.verify(_jwt({'iss': kChatGptIssuer}, header: {'alg': 'RS256', 'kid': 'nope'})),
+              throwsA(isA<ChatGptSignatureException>()));
+        }
+        expect(fetches, 1);
+        // Rotated: the token's kid is not cached yet, the new key set has it.
+        now = now.add(const Duration(minutes: 1));
+        servedKid = 'rotated';
+        await jwks.verify(_jwt({'iss': kChatGptIssuer}, header: {'alg': 'RS256', 'kid': 'rotated'}));
+        expect(fetches, 2);
+      });
+    });
+
+    test('keys that cannot be fetched fail closed', () async {
+      down = true;
+      await expectLater(
+          jwks.verify(_idToken('oaiapp_1', 'n1')), throwsA(isA<ChatGptSignatureException>()));
+    });
+
+    test('short, non-RSA and encryption keys are not usable', () {
+      final n = _b64Int(_rsa.publicKey.modulus!), e = _b64Int(_rsa.publicKey.exponent!);
+      final keys = parseChatGptJwks(jsonEncode({
+        'keys': [
+          {'kty': 'RSA', 'kid': 'ok', 'n': n, 'e': e},
+          {'kty': 'RSA', 'kid': 'enc', 'use': 'enc', 'n': n, 'e': e},
+          {'kty': 'RSA', 'kid': 'ps', 'alg': 'PS256', 'n': n, 'e': e},
+          {'kty': 'RSA', 'kid': 'short', 'n': _b64Int(BigInt.two.pow(1023) + BigInt.one), 'e': e},
+          {'kty': 'EC', 'kid': 'ec', 'x': 'AA', 'y': 'AA'},
+        ],
+      }));
+      expect(keys.keys, ['ok']);
+    });
   });
 
   group('refresh', () {
