@@ -19,6 +19,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
+import '../sync/reset_gate.dart';
 import 'coach_chatgpt_jwks.dart';
 
 const kChatGptIssuer = 'https://auth.openai.com';
@@ -432,12 +433,18 @@ class ChatGptAuth extends ChangeNotifier {
           if (attempt != null && attempt != _attempt) {
             throw ChatGptException('Sign-in was cancelled.');
           }
+          // A sign-in that lands during a reset is revoked, not stored (see [signIn]).
+          if (commit && ResetGate.active) throw ChatGptException('Signed out.');
         }
 
         current();
         final prefs = await SharedPreferences.getInstance();
         if (s == null) {
-          await _secure.delete(key: _kSession, iOptions: _apple, mOptions: _macos);
+          // Best effort: the marker below is what [load] trusts, and the spent
+          // session must leave memory even if the keychain item lingers.
+          try {
+            await _secure.delete(key: _kSession, iOptions: _apple, mOptions: _macos);
+          } catch (_) {}
         } else {
           final raw = jsonEncode(s.toJson());
           try {
@@ -468,6 +475,11 @@ class ChatGptAuth extends ChangeNotifier {
   /// this app alive while it is up (an in-app browser), because the redirect
   /// lands on a listener on this device's loopback.
   Future<void> signIn(Future<bool> Function(Uri) open) async {
+    // A reset does not block the UI, and it clears every preference after
+    // [forgetAll]: a sign-in it overlapped would be left half-stored.
+    if (ResetGate.active) {
+      throw ChatGptException('Wait for the reset to finish, then sign in again.');
+    }
     final generation = _generation;
     final attempt = ++_attempt;
     final prefs = await SharedPreferences.getInstance();

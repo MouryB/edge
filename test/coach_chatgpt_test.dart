@@ -15,6 +15,7 @@ import 'package:openstrap_edge/coach/coach_chatgpt.dart';
 import 'package:openstrap_edge/coach/coach_chatgpt_jwks.dart';
 import 'package:openstrap_edge/coach/coach_config.dart';
 import 'package:openstrap_edge/coach/coach_engine.dart';
+import 'package:openstrap_edge/sync/reset_gate.dart';
 import 'package:pointycastle/export.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -303,6 +304,36 @@ void main() {
       });
     }
 
+    test('a sign-in does not start while a reset is running', () async {
+      ResetGate.enter();
+      addTearDown(ResetGate.resetForTest);
+      auth = ChatGptAuth(client: MockClient((_) async => fail('no network')));
+      await expectLater(
+          auth.signIn((_) async => fail('no browser')),
+          throwsA(isA<ChatGptException>().having((e) => e.message, 'message', contains('reset'))));
+    });
+
+    test('a code exchange that lands while a reset is running is revoked, not stored', () async {
+      addTearDown(ResetGate.resetForTest);
+      final gate = Completer<void>(), arrived = Completer<void>();
+      final revoked = <(String, String, String)>[];
+      late Uri first;
+      auth = pendingExchange(gate, arrived, revoked, () => first);
+      final signIn = expectLater(
+          auth.signIn((u) {
+            first = u;
+            return browser(u, clientId: 'oaiapp_1');
+          }),
+          throwsA(isA<ChatGptException>()));
+      await arrived.future;
+      ResetGate.enter(); // the reset has started but not reached forgetAll yet
+      gate.complete();
+      await signIn;
+      expect(auth.signedIn, isFalse);
+      expect(keychain, isEmpty);
+      expect(revoked, issued);
+    });
+
     test('an ID token that fails its signature check is revoked, not stored', () async {
       final gate = Completer<void>()..complete(), arrived = Completer<void>();
       final revoked = <(String, String, String)>[];
@@ -493,6 +524,19 @@ void main() {
           MockClient((_) async => http.Response(jsonEncode({'error': 'invalid_grant'}), 400)));
       await expectLater(dead.accessToken(), throwsA(isA<ChatGptException>()));
       expect(dead.signedIn, isFalse);
+    });
+
+    test('a dead refresh token signs out even if the keychain delete fails', () async {
+      final dead = await expired(
+          MockClient((_) async => http.Response(jsonEncode({'error': 'invalid_grant'}), 400)));
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        if (call.method == 'delete') throw PlatformException(code: 'boom', message: 'locked');
+        fail('${call.method} must not run');
+      });
+      await expectLater(dead.accessToken(), throwsA(isA<ChatGptException>()));
+      expect(dead.signedIn, isFalse);
+      expect((await SharedPreferences.getInstance()).getBool('coach_chatgpt_present'), isFalse);
     });
   });
 
