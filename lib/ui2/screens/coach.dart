@@ -1052,11 +1052,14 @@ class _CoachSetupState extends State<CoachSetup> {
     // A reply for an endpoint the user has since edited away from would list
     // models the new one may not serve.
     final asked = _base.text;
+    // Switching between ChatGPT and a preset need not change the base URL.
+    final askedChatgpt = _chatgpt;
+    bool stale() => _base.text != asked || _chatgpt != askedChatgpt;
     try {
-      final ids = _chatgpt
+      final ids = askedChatgpt
           ? await chatgpt.listModels()
           : await CoachEngine.fetchModels(asked, _key.text);
-      if (!mounted || _base.text != asked) return;
+      if (!mounted || stale()) return;
       final l = AppLocalizations.of(context);
       setState(() {
         _models = ids;
@@ -1066,7 +1069,7 @@ class _CoachSetupState extends State<CoachSetup> {
             : (l?.coachModelsFound(ids.length) ?? '${ids.length} models. Tap one.');
       });
     } catch (e) {
-      if (!mounted || _base.text != asked) return;
+      if (!mounted || stale()) return;
       final l = AppLocalizations.of(context);
       setState(
         () => _msg = e is CoachException || e is ChatGptException
@@ -1233,6 +1236,9 @@ class _CoachSetupState extends State<CoachSetup> {
           // clearing _msg after it runs would silently
           // discard that explanation.
           _msg = null;
+          // A sign-in still out would otherwise land later and switch the
+          // coach back to ChatGPT over this choice.
+          if (_signingIn) _chatgptAuth.cancelSignIn();
           _chatgpt = false;
           _base.text = preset.baseUrl;
           _api = CoachApi.defaultFor(preset.baseUrl);
