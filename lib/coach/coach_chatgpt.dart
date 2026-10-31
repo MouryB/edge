@@ -666,7 +666,11 @@ class ChatGptAuth extends ChangeNotifier {
       if (!e.terminal) {
         throw ChatGptException('Could not renew the ChatGPT sign-in (${e.status}). Try again.');
       }
-      await _store(null, generation: generation);
+      // Best effort: a failed clear (or a sign-out that got there first) must
+      // not replace the message saying why the coach stopped.
+      try {
+        await _store(null, generation: generation);
+      } catch (_) {}
       throw ChatGptException('Your ChatGPT sign-in has ended. Sign in again from AI settings.');
     } catch (e) {
       // A network hiccup is not a revoked session — the tokens stay.
